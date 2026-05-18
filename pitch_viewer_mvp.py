@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 
 """
-Pitch Viewer - Etapa 2
+Pitch Viewer - Etapa 3
 
-MVP extendido para escritorio:
+Aplicación de escritorio con refinamiento de seguimiento vocal:
 - captura de entrada con sounddevice;
 - detección F0 monofónica con autocorrelación FFT;
-- visualización tipo piano-roll en Tkinter;
-- menú de configuración para audio, vista, escala, idioma de notas y afinación.
+- estabilización temporal con mediana, suavizado y guardia de octava;
+- visualización tipo piano-roll en Tkinter con bandas de tolerancia, escala y evaluación de afinación.
 """
 
+import csv
 import math
 import queue
 import threading
@@ -19,7 +20,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import numpy as np
 
@@ -131,9 +132,14 @@ class AppSettings:
     scale_root: int = 0
     tolerance_cents: int = 30
     show_out_of_scale: bool = True
+    show_tolerance_bands: bool = True
+    show_center_lines: bool = True
     confidence_threshold: float = 0.35
     rms_threshold: float = 0.006
     smoothing_factor: float = 0.35
+    median_window: int = 5
+    max_jump_semitones: float = 7.0
+    octave_guard: bool = True
 
 
 @dataclass
@@ -141,9 +147,16 @@ class PitchPoint:
     time_s: float
     freq_hz: float
     midi_float: float
+    raw_midi_float: float
     confidence: float
     rms: float
     voiced: bool
+
+    @property
+    def cents(self) -> float:
+        if not self.voiced or math.isnan(self.midi_float):
+            return float("nan")
+        return cents_from_nearest_note(self.midi_float)
 
 
 @dataclass
@@ -548,11 +561,97 @@ class DetectorSettingsDialog(tk.Toplevel):
         self.destroy()
 
 
+class StabilitySettingsDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Tk, settings: AppSettings) -> None:
+        super().__init__(parent)
+
+        self.title("Estabilidad de pitch")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.result: Optional[tuple[int, float, bool]] = None
+
+        self.median_var = tk.StringVar(value=str(settings.median_window))
+        self.max_jump_var = tk.StringVar(value=f"{settings.max_jump_semitones:.1f}")
+        self.octave_guard_var = tk.BooleanVar(value=settings.octave_guard)
+
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(body, text="Ventana de mediana:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
+        ttk.Entry(body, textvariable=self.median_var, width=12).grid(row=0, column=1, sticky="w", pady=5)
+        ttk.Label(body, text="frames; recomendado: 3, 5 o 7").grid(row=0, column=2, sticky="w", padx=(8, 0), pady=5)
+
+        ttk.Label(body, text="Salto máximo:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
+        ttk.Entry(body, textvariable=self.max_jump_var, width=12).grid(row=1, column=1, sticky="w", pady=5)
+        ttk.Label(body, text="semitonos por frame; recomendado: 5 a 9").grid(row=1, column=2, sticky="w", padx=(8, 0), pady=5)
+
+        ttk.Checkbutton(
+            body,
+            text="Corregir saltos falsos de octava",
+            variable=self.octave_guard_var,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 4))
+
+        hint = ttk.Label(
+            body,
+            text=(
+                "La mediana reduce temblores del detector. La guardia de octava busca \"plegar\" "
+                "saltos ±12 semitonos cuando el frame anterior sugiere que son errores."
+            ),
+            wraplength=520,
+        )
+        hint.grid(row=3, column=0, columnspan=3, sticky="we", pady=(4, 0))
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=4, column=0, columnspan=3, sticky="e", pady=(12, 0))
+
+        ttk.Button(buttons, text="Cancelar", command=self._cancel).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(buttons, text="Aceptar", command=self._accept).pack(side=tk.RIGHT)
+
+        self.bind("<Escape>", lambda _event: self._cancel())
+        self.bind("<Return>", lambda _event: self._accept())
+
+        self.grab_set()
+        self.update_idletasks()
+        self._center_over_parent(parent)
+        self.wait_window(self)
+
+    def _center_over_parent(self, parent: tk.Tk) -> None:
+        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_reqwidth()) // 2)
+        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_reqheight()) // 2)
+        self.geometry(f"+{x}+{y}")
+
+    def _accept(self) -> None:
+        try:
+            median_window = int(self.median_var.get())
+            max_jump = float(self.max_jump_var.get())
+        except ValueError:
+            messagebox.showerror("Valor inválido", "Los valores deben ser numéricos.", parent=self)
+            return
+
+        if median_window < 1 or median_window > 21:
+            messagebox.showerror("Valor inválido", "La ventana de mediana debe estar entre 1 y 21.", parent=self)
+            return
+
+        if median_window % 2 == 0:
+            median_window += 1
+
+        if not 1.0 <= max_jump <= 24.0:
+            messagebox.showerror("Valor inválido", "El salto máximo debe estar entre 1 y 24 semitonos.", parent=self)
+            return
+
+        self.result = (median_window, max_jump, bool(self.octave_guard_var.get()))
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+
 class PitchViewerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
 
-        self.title("Monitor de afinación vocal - Etapa 2")
+        self.title("Monitor de afinación vocal - Etapa 3")
         self.geometry("1120x780")
         self.minsize(900, 600)
 
@@ -575,6 +674,7 @@ class PitchViewerApp(tk.Tk):
         self.points: deque[PitchPoint] = deque(maxlen=20000)
         self.current_point: Optional[PitchPoint] = None
         self.last_smoothed_midi: Optional[float] = None
+        self.recent_midi_values: deque[float] = deque(maxlen=self.settings.median_window)
 
         self.audio_devices: list[InputDevice] = []
         self.selected_device_index: Optional[int] = None
@@ -586,11 +686,14 @@ class PitchViewerApp(tk.Tk):
         self.tolerance_var = tk.IntVar(value=self.settings.tolerance_cents)
         self.a4_var = tk.StringVar(value=f"{self.settings.a4_hz:.1f}")
         self.show_out_of_scale_var = tk.BooleanVar(value=self.settings.show_out_of_scale)
+        self.show_tolerance_bands_var = tk.BooleanVar(value=self.settings.show_tolerance_bands)
+        self.show_center_lines_var = tk.BooleanVar(value=self.settings.show_center_lines)
 
         self.note_status_var = tk.StringVar(value="Nota: —")
         self.freq_status_var = tk.StringVar(value="Frecuencia: —")
         self.cents_status_var = tk.StringVar(value="Desviación: —")
         self.conf_status_var = tk.StringVar(value="Confianza: —")
+        self.assessment_status_var = tk.StringVar(value="Estado: —")
         self.scale_status_var = tk.StringVar(value="Escala: cromática")
         self.range_status_var = tk.StringVar(value="Rango: —")
         self.audio_status_var = tk.StringVar(value="Audio: detenido")
@@ -610,6 +713,7 @@ class PitchViewerApp(tk.Tk):
 
         file_menu = tk.Menu(menubar, tearoff=False)
         file_menu.add_command(label="Limpiar historial", command=self._clear_history)
+        file_menu.add_command(label="Exportar historial CSV...", command=self._export_history_csv)
         file_menu.add_separator()
         file_menu.add_command(label="Salir", command=self._on_close)
         menubar.add_cascade(label="Archivo", menu=file_menu)
@@ -622,6 +726,7 @@ class PitchViewerApp(tk.Tk):
         audio_menu.add_command(label="Actualizar dispositivos", command=lambda: self._load_audio_devices(select_default=False))
         audio_menu.add_separator()
         audio_menu.add_command(label="Parámetros de detección...", command=self._open_detector_settings)
+        audio_menu.add_command(label="Estabilidad de pitch...", command=self._open_stability_settings)
         menubar.add_cascade(label="Audio", menu=audio_menu)
 
         view_menu = tk.Menu(menubar, tearoff=False)
@@ -645,6 +750,17 @@ class PitchViewerApp(tk.Tk):
         range_menu.add_command(label="Personalizado por nota...", command=self._open_range_dialog)
         range_menu.add_command(label="Personalizado por Hz...", command=self._open_range_hz_dialog)
         view_menu.add_cascade(label="Rango visible", menu=range_menu)
+        view_menu.add_separator()
+        view_menu.add_checkbutton(
+            label="Mostrar bandas de tolerancia",
+            variable=self.show_tolerance_bands_var,
+            command=self._toggle_tolerance_bands,
+        )
+        view_menu.add_checkbutton(
+            label="Mostrar centro exacto de nota",
+            variable=self.show_center_lines_var,
+            command=self._toggle_center_lines,
+        )
         menubar.add_cascade(label="Vista", menu=view_menu)
 
         scale_menu = tk.Menu(menubar, tearoff=False)
@@ -751,6 +867,7 @@ class PitchViewerApp(tk.Tk):
         ttk.Label(status, textvariable=self.freq_status_var).pack(side=tk.LEFT, padx=(0, 18))
         ttk.Label(status, textvariable=self.cents_status_var).pack(side=tk.LEFT, padx=(0, 18))
         ttk.Label(status, textvariable=self.conf_status_var).pack(side=tk.LEFT, padx=(0, 18))
+        ttk.Label(status, textvariable=self.assessment_status_var).pack(side=tk.LEFT, padx=(0, 18))
 
         settings_row = ttk.Frame(root)
         settings_row.pack(fill=tk.X, side=tk.TOP, pady=(0, 6))
@@ -769,7 +886,7 @@ class PitchViewerApp(tk.Tk):
         footer = ttk.Label(
             root,
             text=(
-                "Etapa 2: menú de configuración, escalas, octava, tolerancia y rango visible. "
+                "Etapa 3: estabilización, bandas de tolerancia, evaluación de afinación y exportación CSV. "
                 "Usa audífonos para evitar que el micrófono capture los parlantes."
             ),
             anchor="w",
@@ -900,6 +1017,7 @@ class PitchViewerApp(tk.Tk):
         self.points.clear()
         self.current_point = None
         self.last_smoothed_midi = None
+        self.recent_midi_values = deque(maxlen=max(1, self.settings.median_window))
         self.time_origin = time.perf_counter()
 
         try:
@@ -977,6 +1095,9 @@ class PitchViewerApp(tk.Tk):
                 confidence_threshold = self.settings.confidence_threshold
                 rms_threshold = self.settings.rms_threshold
                 smoothing_factor = self.settings.smoothing_factor
+                median_window = max(1, int(self.settings.median_window))
+                max_jump_semitones = float(self.settings.max_jump_semitones)
+                octave_guard = bool(self.settings.octave_guard)
 
             detect_min_hz = max(MIN_DETECTABLE_HZ, midi_to_freq(min_midi - 8, a4_hz))
             detect_max_hz = min(MAX_DETECTABLE_HZ, midi_to_freq(max_midi + 8, a4_hz))
@@ -996,18 +1117,32 @@ class PitchViewerApp(tk.Tk):
                 and rms >= rms_threshold
             )
 
+            raw_midi = float("nan")
+
             if voiced:
-                midi_raw = freq_to_midi(freq_hz, a4_hz)
+                raw_midi = freq_to_midi(freq_hz, a4_hz)
+
+                if octave_guard and self.last_smoothed_midi is not None:
+                    raw_midi = self._correct_octave_jump(raw_midi, self.last_smoothed_midi)
+
+                if self.recent_midi_values.maxlen != median_window:
+                    recent_tail = list(self.recent_midi_values)[-median_window:]
+                    self.recent_midi_values = deque(recent_tail, maxlen=median_window)
+
+                self.recent_midi_values.append(raw_midi)
+                midi_stable = float(np.median(np.asarray(self.recent_midi_values, dtype=np.float64)))
 
                 if self.last_smoothed_midi is None:
-                    midi_smooth = midi_raw
-                elif abs(midi_raw - self.last_smoothed_midi) > 8.0:
-                    midi_smooth = midi_raw
+                    midi_smooth = midi_stable
                 else:
-                    midi_smooth = (
-                        smoothing_factor * midi_raw
-                        + (1.0 - smoothing_factor) * self.last_smoothed_midi
-                    )
+                    jump = abs(midi_stable - self.last_smoothed_midi)
+                    if jump > max_jump_semitones and confidence < max(0.75, confidence_threshold):
+                        midi_smooth = self.last_smoothed_midi
+                    else:
+                        midi_smooth = (
+                            smoothing_factor * midi_stable
+                            + (1.0 - smoothing_factor) * self.last_smoothed_midi
+                        )
 
                 self.last_smoothed_midi = midi_smooth
             else:
@@ -1015,11 +1150,13 @@ class PitchViewerApp(tk.Tk):
 
                 if rms < rms_threshold * 0.5:
                     self.last_smoothed_midi = None
+                    self.recent_midi_values.clear()
 
             point = PitchPoint(
                 time_s=time.perf_counter() - self.time_origin,
                 freq_hz=freq_hz,
                 midi_float=midi_smooth,
+                raw_midi_float=raw_midi,
                 confidence=confidence,
                 rms=rms,
                 voiced=voiced,
@@ -1037,6 +1174,11 @@ class PitchViewerApp(tk.Tk):
                     self.pitch_queue.put_nowait(point)
                 except queue.Full:
                     pass
+
+    @staticmethod
+    def _correct_octave_jump(midi_raw: float, previous_midi: float) -> float:
+        candidates = [midi_raw + 12.0 * k for k in range(-3, 4)]
+        return min(candidates, key=lambda value: abs(value - previous_midi))
 
     def _ui_loop(self) -> None:
         self._consume_pitch_points()
@@ -1075,6 +1217,7 @@ class PitchViewerApp(tk.Tk):
         self.points.clear()
         self.current_point = None
         self.last_smoothed_midi = None
+        self.recent_midi_values.clear()
 
     def _set_time_window(self, seconds: int) -> None:
         with self.settings_lock:
@@ -1173,6 +1316,18 @@ class PitchViewerApp(tk.Tk):
 
         self._refresh_status_labels()
 
+    def _toggle_tolerance_bands(self) -> None:
+        with self.settings_lock:
+            self.settings.show_tolerance_bands = bool(self.show_tolerance_bands_var.get())
+
+        self._refresh_status_labels()
+
+    def _toggle_center_lines(self) -> None:
+        with self.settings_lock:
+            self.settings.show_center_lines = bool(self.show_center_lines_var.get())
+
+        self._refresh_status_labels()
+
     def _set_a4(self, hz: float) -> None:
         if hz <= 0:
             return
@@ -1240,6 +1395,82 @@ class PitchViewerApp(tk.Tk):
 
         self._refresh_status_labels()
 
+    def _open_stability_settings(self) -> None:
+        dialog = StabilitySettingsDialog(self, self.settings)
+        if dialog.result is None:
+            return
+
+        median_window, max_jump_semitones, octave_guard = dialog.result
+        with self.settings_lock:
+            self.settings.median_window = median_window
+            self.settings.max_jump_semitones = max_jump_semitones
+            self.settings.octave_guard = octave_guard
+
+        self.recent_midi_values = deque(list(self.recent_midi_values)[-median_window:], maxlen=median_window)
+        self._refresh_status_labels()
+
+    def _export_history_csv(self) -> None:
+        if not self.points:
+            messagebox.showinfo("Exportar historial", "No hay puntos para exportar.")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Exportar historial CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Todos los archivos", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+
+        with self.settings_lock:
+            settings = AppSettings(**self.settings.__dict__)
+            scale_pcs = scale_pitch_classes(settings.scale_root, settings.scale_name)
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "time_s",
+                    "freq_hz",
+                    "midi_smooth",
+                    "midi_raw",
+                    "note",
+                    "cents",
+                    "confidence",
+                    "rms",
+                    "voiced",
+                    "in_scale",
+                ])
+                for point in self.points:
+                    if point.voiced and not math.isnan(point.midi_float):
+                        nearest = int(round(point.midi_float))
+                        note = midi_to_note_name(nearest, settings.note_language)
+                        cents = cents_from_nearest_note(point.midi_float)
+                        in_scale = nearest % 12 in scale_pcs
+                    else:
+                        note = ""
+                        cents = ""
+                        in_scale = ""
+
+                    writer.writerow([
+                        f"{point.time_s:.6f}",
+                        f"{point.freq_hz:.6f}",
+                        "" if math.isnan(point.midi_float) else f"{point.midi_float:.6f}",
+                        "" if math.isnan(point.raw_midi_float) else f"{point.raw_midi_float:.6f}",
+                        note,
+                        cents,
+                        f"{point.confidence:.6f}",
+                        f"{point.rms:.6f}",
+                        int(point.voiced),
+                        in_scale,
+                    ])
+        except Exception as exc:
+            messagebox.showerror("Exportar historial", f"No se pudo guardar el CSV:\n{exc}")
+            return
+
+        messagebox.showinfo("Exportar historial", f"Historial exportado:\n{path}")
+
     def _refresh_status_labels(self) -> None:
         with self.settings_lock:
             settings = AppSettings(**self.settings.__dict__)
@@ -1254,7 +1485,8 @@ class PitchViewerApp(tk.Tk):
             f"Rango: {min_note} - {max_note} ({min_hz:.0f} - {max_hz:.0f} Hz)"
         )
         self.settings_status_var.set(
-            f"A4: {settings.a4_hz:.1f} Hz | Ventana: {settings.time_window_s}s | Tolerancia: ±{settings.tolerance_cents} cents"
+            f"A4: {settings.a4_hz:.1f} Hz | Ventana: {settings.time_window_s}s | "
+            f"Tolerancia: ±{settings.tolerance_cents} cents | Mediana: {settings.median_window}"
         )
 
     def _update_status(self) -> None:
@@ -1269,6 +1501,7 @@ class PitchViewerApp(tk.Tk):
             self.freq_status_var.set("Frecuencia: —")
             self.cents_status_var.set("Desviación: —")
             self.conf_status_var.set("Confianza: —")
+            self.assessment_status_var.set("Estado: —")
             return
 
         nearest_midi = int(round(point.midi_float))
@@ -1281,6 +1514,21 @@ class PitchViewerApp(tk.Tk):
         self.freq_status_var.set(f"Frecuencia: {point.freq_hz:7.2f} Hz")
         self.cents_status_var.set(f"Desviación: {cents:+6.1f} cents")
         self.conf_status_var.set(f"Confianza: {point.confidence:0.2f} | RMS: {point.rms:0.4f}")
+        self.assessment_status_var.set(f"Estado: {self._assessment_text(cents, in_scale, settings)}")
+
+    @staticmethod
+    def _assessment_text(cents: float, in_scale: bool, settings: AppSettings) -> str:
+        if not in_scale:
+            return "fuera de escala"
+
+        abs_cents = abs(cents)
+        if abs_cents <= max(3.0, settings.tolerance_cents * 0.25):
+            return "centrado"
+        if abs_cents <= settings.tolerance_cents:
+            return "dentro de tolerancia"
+        if cents > 0:
+            return "alto"
+        return "bajo"
 
     def _redraw_canvas(self) -> None:
         canvas = self.canvas
@@ -1400,7 +1648,7 @@ class PitchViewerApp(tk.Tk):
 
             canvas.create_rectangle(plot_left, y1, plot_right, y2, fill=fill, outline="")
 
-            if is_scale_note:
+            if is_scale_note and settings.show_tolerance_bands:
                 tolerance_top = midi_to_y(midi_value + tolerance)
                 tolerance_bottom = midi_to_y(midi_value - tolerance)
                 canvas.create_rectangle(
@@ -1410,6 +1658,24 @@ class PitchViewerApp(tk.Tk):
                     max(plot_top, min(plot_bottom, tolerance_bottom)),
                     fill="#263f36",
                     outline="",
+                )
+                canvas.create_line(
+                    plot_left,
+                    max(plot_top, min(plot_bottom, tolerance_top)),
+                    plot_right,
+                    max(plot_top, min(plot_bottom, tolerance_top)),
+                    fill="#335747",
+                    width=1,
+                    dash=(2, 4),
+                )
+                canvas.create_line(
+                    plot_left,
+                    max(plot_top, min(plot_bottom, tolerance_bottom)),
+                    plot_right,
+                    max(plot_top, min(plot_bottom, tolerance_bottom)),
+                    fill="#335747",
+                    width=1,
+                    dash=(2, 4),
                 )
 
             label_fill = "#dfe7ee" if is_scale_note else "#87929b"
@@ -1427,7 +1693,9 @@ class PitchViewerApp(tk.Tk):
 
             center_y = midi_to_y(midi_value)
             center_line = "#52616b" if is_scale_note else "#2a333a"
-            canvas.create_line(plot_left, center_y, plot_right, center_y, fill=center_line, width=1)
+            if settings.show_center_lines or is_scale_note:
+                width = 2 if is_scale_note and settings.show_center_lines else 1
+                canvas.create_line(plot_left, center_y, plot_right, center_y, fill=center_line, width=width)
 
             should_label = (midi_value - settings.min_midi) % label_every == 0
             if should_label and (settings.show_out_of_scale or is_scale_note):
@@ -1552,6 +1820,27 @@ class PitchViewerApp(tk.Tk):
                         outline=color,
                         width=2,
                     )
+                    nearest = int(round(midi_value))
+                    note_text = midi_to_note_name(nearest, settings.note_language)
+                    cents = cents_from_nearest_note(midi_value)
+                    label = f"{note_text} {cents:+.0f}c"
+                    canvas.create_rectangle(
+                        plot_right - 88,
+                        y - 14,
+                        plot_right - 10,
+                        y + 14,
+                        fill="#0f1720",
+                        outline=color,
+                        width=1,
+                    )
+                    canvas.create_text(
+                        plot_right - 49,
+                        y,
+                        text=label,
+                        fill="#e5edf3",
+                        font=("TkDefaultFont", 9, "bold"),
+                        anchor="center",
+                    )
 
     @staticmethod
     def _curve_color(point: PitchPoint, settings: AppSettings, scale_pcs: set[int]) -> str:
@@ -1570,9 +1859,10 @@ class PitchViewerApp(tk.Tk):
     def _show_about(self) -> None:
         messagebox.showinfo(
             "Acerca de",
-            "Monitor de afinación vocal - Etapa 2\n\n"
+            "Monitor de afinación vocal - Etapa 3\n\n"
             "Backend actual: autocorrelación FFT con NumPy.\n"
-            "Diseñado para validar interfaz, audio, escalas y visualización.\n\n"
+            "Esta etapa agrega mediana temporal, guardia de octava, \"jump gate\", \n"
+            "bandas de tolerancia configurables, evaluación de afinación y exportación CSV.\n\n"
             "Siguiente backend recomendado: torchcrepe o pYIN.",
         )
 
