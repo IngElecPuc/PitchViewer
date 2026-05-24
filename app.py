@@ -42,6 +42,11 @@ from .constants import (
     TIME_WINDOWS,
     TOLERANCE_OPTIONS,
 )
+from .karaoke.analyzer import build_note_segments, pitch_points_to_frames, settings_snapshot
+from .karaoke.audio_loader import LoadedAudio, load_audio_file
+from .karaoke.lyrics import LyricsLine, current_lyric_line, load_lyrics_file
+from .karaoke.models import KaraokeAudioInfo, KaraokeProject, KaraokeNoteSegment
+from .karaoke.project_file import save_pvk
 from .detection.registry import (
     BACKENDS,
     BACKEND_AUTOCORRELATION,
@@ -80,7 +85,7 @@ class PitchViewerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
 
-        self.title("Monitor de afinación vocal - v0.8.2")
+        self.title("Monitor de afinación vocal - v0.9.0")
 
         self.settings_load_result = load_settings()
         self.settings = self.settings_load_result.settings
@@ -163,6 +168,19 @@ class PitchViewerApp(tk.Tk):
         self._range_drag_start_max_midi: Optional[int] = None
         self.calibration_visual_info: Optional[dict[str, object]] = None
         self.calibration_visual_until_s: float = 0.0
+
+        self.karaoke_panel_visible = False
+        self.karaoke_audio: Optional[LoadedAudio] = None
+        self.karaoke_project: Optional[KaraokeProject] = None
+        self.karaoke_segments: list[KaraokeNoteSegment] = []
+        self.karaoke_lyrics_lines: list[LyricsLine] = []
+        self.karaoke_analysis_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.karaoke_analysis_running = False
+        self.karaoke_timeline_updating = False
+        self.karaoke_timeline_var = tk.DoubleVar(value=0.0)
+        self.karaoke_status_var = tk.StringVar(value="Karaoke: sin pista cargada")
+        self.karaoke_time_var = tk.StringVar(value="00:00.000 / 00:00.000")
+        self.karaoke_current_lyric_var = tk.StringVar(value="")
 
         self.note_status_var = tk.StringVar(value="Nota: —")
         self.freq_status_var = tk.StringVar(value="Frecuencia: —")
@@ -430,6 +448,17 @@ class PitchViewerApp(tk.Tk):
         )
         menubar.add_cascade(label="Calibración", menu=calibration_menu)
 
+        karaoke_menu = tk.Menu(menubar, tearoff=False)
+        karaoke_menu.add_command(label="Mostrar/ocultar panel karaoke", command=self._toggle_karaoke_panel)
+        karaoke_menu.add_separator()
+        karaoke_menu.add_command(label="Nuevo proyecto desde audio...", command=self._load_karaoke_audio)
+        karaoke_menu.add_command(label="Importar letra...", command=self._import_karaoke_lyrics)
+        karaoke_menu.add_command(label="Analizar pista vocal", command=self._analyze_karaoke_audio)
+        karaoke_menu.add_separator()
+        karaoke_menu.add_command(label="Guardar proyecto .pvk...", command=self._save_karaoke_project)
+        karaoke_menu.add_command(label="Exportar segmentos CSV...", command=self._export_karaoke_segments_csv)
+        menubar.add_cascade(label="Karaoke", menu=karaoke_menu)
+
         help_menu = tk.Menu(menubar, tearoff=False)
         help_menu.add_command(label="Acerca de", command=self._show_about)
         menubar.add_cascade(label="Ayuda", menu=help_menu)
@@ -511,10 +540,12 @@ class PitchViewerApp(tk.Tk):
         self.canvas.bind("<B3-Motion>", self._on_range_drag_move)
         self.canvas.bind("<ButtonRelease-3>", self._on_range_drag_end)
 
+        self._build_karaoke_panel(root)
+
         footer = ttk.Label(
             root,
             text=(
-                "v0.8.2: transporte visual corregido, panel instructivo temporal y calibración visible. "
+                "v0.9.0: karaoke producción (.pvk), análisis offline de pista vocal y letras. "
                 "Usa audífonos para evitar que el micrófono capture los parlantes."
             ),
             anchor="w",
@@ -1601,7 +1632,9 @@ class PitchViewerApp(tk.Tk):
         self._update_transient_overlays()
         self._consume_offline_analysis_results()
         self._consume_calibration_results()
+        self._consume_karaoke_analysis_results()
         self._consume_pitch_points()
+        self._update_karaoke_panel_state()
         self._update_status()
         self._redraw_canvas()
         self.after(33, self._ui_loop)
@@ -2354,6 +2387,19 @@ class PitchViewerApp(tk.Tk):
                 midi_to_y=midi_to_y,
             )
 
+        self._draw_karaoke_segments(
+            canvas=canvas,
+            settings=settings,
+            palette=palette,
+            plot_left=plot_left,
+            plot_right=plot_right,
+            plot_top=plot_top,
+            plot_bottom=plot_bottom,
+            visible_min_midi=visible_min_midi,
+            visible_max_midi=visible_max_midi,
+            midi_to_y=midi_to_y,
+        )
+
         self._draw_pitch_curve(
             canvas=canvas,
             settings=settings,
@@ -2855,6 +2901,458 @@ class PitchViewerApp(tk.Tk):
             return None
         return nearest_midi
 
+
+    def _build_karaoke_panel(self, parent: tk.Widget) -> None:
+        self.karaoke_panel = ttk.LabelFrame(parent, text="Karaoke producción", padding=8)
+
+        controls = ttk.Frame(self.karaoke_panel)
+        controls.pack(fill=tk.X, side=tk.TOP)
+
+        ttk.Button(controls, text="Abrir audio...", command=self._load_karaoke_audio).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(controls, text="Importar letra...", command=self._import_karaoke_lyrics).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(controls, text="Analizar pista", command=self._analyze_karaoke_audio).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(controls, text="Guardar .pvk...", command=self._save_karaoke_project).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(controls, textvariable=self.karaoke_status_var).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(controls, textvariable=self.karaoke_time_var).pack(side=tk.RIGHT)
+
+        timeline = ttk.Frame(self.karaoke_panel)
+        timeline.pack(fill=tk.X, side=tk.TOP, pady=(8, 4))
+        ttk.Button(timeline, text="⏮", width=4, command=self._jump_karaoke_start).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(timeline, text="⏪", width=4, command=self._transport_backward).pack(side=tk.LEFT, padx=(0, 4))
+        self.karaoke_scale = ttk.Scale(
+            timeline,
+            from_=0.0,
+            to=1.0,
+            orient=tk.HORIZONTAL,
+            variable=self.karaoke_timeline_var,
+            command=self._set_karaoke_cursor_from_slider,
+        )
+        self.karaoke_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        ttk.Button(timeline, text="⏩", width=4, command=self._transport_forward).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(timeline, text="⏭", width=4, command=self._jump_karaoke_end).pack(side=tk.LEFT)
+
+        ttk.Label(self.karaoke_panel, textvariable=self.karaoke_current_lyric_var, anchor="center").pack(fill=tk.X, pady=(2, 4))
+
+        self.karaoke_lyrics_text = tk.Text(self.karaoke_panel, height=5, wrap=tk.WORD)
+        self.karaoke_lyrics_text.pack(fill=tk.BOTH, expand=False)
+        self.karaoke_lyrics_text.insert("1.0", "Carga una pista vocal y, opcionalmente, una letra .txt o .lrc.")
+        self.karaoke_lyrics_text.configure(state=tk.DISABLED)
+
+    def _toggle_karaoke_panel(self) -> None:
+        if self.karaoke_panel_visible:
+            self.karaoke_panel.pack_forget()
+            self.karaoke_panel_visible = False
+            return
+        self._show_karaoke_panel()
+
+    def _show_karaoke_panel(self) -> None:
+        if not self.karaoke_panel_visible:
+            self.karaoke_panel.pack(fill=tk.X, side=tk.BOTTOM, before=self.canvas, pady=(8, 0))
+            self.karaoke_panel_visible = True
+
+    def _format_time(self, seconds: float) -> str:
+        seconds = max(0.0, float(seconds))
+        minutes = int(seconds // 60)
+        rem = seconds - 60 * minutes
+        return f"{minutes:02d}:{rem:06.3f}"
+
+    def _load_karaoke_audio(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Abrir pista vocal para karaoke",
+            filetypes=[
+                ("Audio", "*.wav *.flac *.ogg *.mp3 *.m4a *.mp4"),
+                ("WAV", "*.wav"),
+                ("Todos los archivos", "*.*"),
+            ],
+            parent=self,
+        )
+        if not path:
+            return
+
+        try:
+            loaded = load_audio_file(path, selected_channel="mix")
+        except Exception as exc:
+            messagebox.showerror(
+                "Karaoke",
+                f"No se pudo cargar el audio:\n\n{exc}\n\n"
+                "Recomendación para esta etapa: usa WAV. Para MP3/MP4 instala ffmpeg y deja ffmpeg en PATH.",
+                parent=self,
+            )
+            return
+
+        channel_mode = loaded.selected_channel
+        if loaded.channels > 1:
+            answer = simpledialog.askstring(
+                "Canal de audio",
+                "El archivo tiene más de un canal. Escribe una opción:\n\n"
+                "mix      = promedio mono\n"
+                "left     = canal izquierdo\n"
+                "right    = canal derecho\n"
+                "max_rms  = canal con mayor RMS",
+                initialvalue="mix",
+                parent=self,
+            )
+            if answer:
+                channel_mode = answer.strip().lower()
+                try:
+                    loaded = load_audio_file(path, selected_channel=channel_mode)
+                except Exception as exc:
+                    messagebox.showerror("Karaoke", f"No se pudo recargar con ese canal:\n\n{exc}", parent=self)
+                    return
+
+        self.karaoke_audio = loaded
+        self.karaoke_segments = []
+        self.karaoke_lyrics_lines = []
+        self.karaoke_project = KaraokeProject(
+            title=os.path.splitext(loaded.filename)[0],
+            artist="",
+            audio_info=KaraokeAudioInfo(
+                path=loaded.path,
+                filename=loaded.filename,
+                sample_rate=loaded.sample_rate,
+                channels=loaded.channels,
+                selected_channel=loaded.selected_channel,
+                duration_s=loaded.duration_s,
+            ),
+        )
+
+        self.points.clear()
+        self.current_point = None
+        self.offline_mode = True
+        self.offline_duration_s = loaded.duration_s
+        self.offline_cursor_s = 0.0
+        self.karaoke_timeline_var.set(0.0)
+        try:
+            self.karaoke_scale.configure(to=max(0.001, loaded.duration_s))
+        except Exception:
+            pass
+
+        self.karaoke_status_var.set(
+            f"Audio: {loaded.filename} | {loaded.sample_rate} Hz | {loaded.duration_s:.1f}s | canal {loaded.selected_channel}"
+        )
+        self.audio_status_var.set("Karaoke: audio cargado; falta analizar pista")
+        self._show_karaoke_panel()
+        self._update_karaoke_panel_state(force=True)
+
+    def _import_karaoke_lyrics(self) -> None:
+        if self.karaoke_project is None:
+            self.karaoke_project = KaraokeProject(title="Proyecto karaoke")
+
+        path = filedialog.askopenfilename(
+            title="Importar letra",
+            filetypes=[("Letras", "*.txt *.lrc"), ("Todos los archivos", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+
+        try:
+            lyrics_text, lyrics_lrc, lines = load_lyrics_file(path)
+        except Exception as exc:
+            messagebox.showerror("Karaoke", f"No se pudo cargar la letra:\n\n{exc}", parent=self)
+            return
+
+        self.karaoke_project.lyrics_text = lyrics_text
+        self.karaoke_project.lyrics_lrc = lyrics_lrc
+        self.karaoke_lyrics_lines = lines
+        self._set_karaoke_lyrics_text(lyrics_lrc if lyrics_lrc.strip() else lyrics_text)
+        self.karaoke_status_var.set(f"Letra importada: {os.path.basename(path)}")
+        self._show_karaoke_panel()
+        self._update_karaoke_panel_state(force=True)
+
+    def _set_karaoke_lyrics_text(self, text: str) -> None:
+        self.karaoke_lyrics_text.configure(state=tk.NORMAL)
+        self.karaoke_lyrics_text.delete("1.0", tk.END)
+        self.karaoke_lyrics_text.insert("1.0", text or "Sin letra cargada.")
+        self.karaoke_lyrics_text.configure(state=tk.DISABLED)
+
+    def _analyze_karaoke_audio(self) -> None:
+        if self.karaoke_audio is None:
+            messagebox.showinfo("Karaoke", "Primero carga una pista vocal.", parent=self)
+            return
+        if self.karaoke_analysis_running:
+            messagebox.showinfo("Karaoke", "Ya hay un análisis karaoke en curso.", parent=self)
+            return
+
+        audio = np.asarray(self.karaoke_audio.audio, dtype=np.float32)
+        sample_rate = int(self.karaoke_audio.sample_rate)
+        if audio.size < max(1024, sample_rate // 4):
+            messagebox.showerror("Karaoke", "El audio es demasiado corto para analizar.", parent=self)
+            return
+
+        self.karaoke_analysis_running = True
+        with self.settings_lock:
+            backend_id = normalize_backend_id(self.settings.offline_detector_backend)
+        self.audio_status_var.set(
+            f"Karaoke: analizando con {backend_label(backend_id)} | {audio.size / max(1, sample_rate):.1f}s"
+        )
+        self.karaoke_status_var.set("Analizando pista vocal...")
+        self._show_karaoke_panel()
+
+        thread = threading.Thread(
+            target=self._karaoke_analysis_worker,
+            args=(audio.copy(), sample_rate),
+            daemon=True,
+        )
+        thread.start()
+
+    def _karaoke_analysis_worker(self, audio: np.ndarray, sample_rate: int) -> None:
+        try:
+            points, info = self._analyze_audio_offline(audio, sample_rate)
+            with self.settings_lock:
+                settings = AppSettings(**self.settings.__dict__)
+            frames = pitch_points_to_frames(points)
+            segments = build_note_segments(points, settings)
+            snapshot = settings_snapshot(settings)
+            payload = (points, frames, segments, snapshot, info)
+            self.karaoke_analysis_queue.put(("ok", payload))
+        except Exception as exc:
+            self.karaoke_analysis_queue.put(("error", f"{type(exc).__name__}: {exc}"))
+
+    def _consume_karaoke_analysis_results(self) -> None:
+        while True:
+            try:
+                status, payload = self.karaoke_analysis_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            self.karaoke_analysis_running = False
+            if status == "error":
+                self.karaoke_status_var.set("Karaoke: error de análisis")
+                self.audio_status_var.set("Karaoke: error de análisis")
+                messagebox.showerror("Karaoke", f"No se pudo analizar la pista:\n\n{payload}", parent=self)
+                return
+
+            points, frames, segments, snapshot, info = payload  # type: ignore[misc]
+            self._apply_karaoke_analysis_result(points, frames, segments, snapshot, info)
+
+    def _apply_karaoke_analysis_result(self, points, frames, segments, snapshot, info) -> None:
+        if self.karaoke_audio is None:
+            return
+        if self.karaoke_project is None:
+            self.karaoke_project = KaraokeProject(title=os.path.splitext(self.karaoke_audio.filename)[0])
+
+        self.karaoke_project.audio_info = KaraokeAudioInfo(
+            path=self.karaoke_audio.path,
+            filename=self.karaoke_audio.filename,
+            sample_rate=self.karaoke_audio.sample_rate,
+            channels=self.karaoke_audio.channels,
+            selected_channel=self.karaoke_audio.selected_channel,
+            duration_s=self.karaoke_audio.duration_s,
+        )
+        self.karaoke_project.frames = list(frames)
+        self.karaoke_project.note_segments = list(segments)
+        self.karaoke_project.settings_snapshot = dict(snapshot)
+        self.karaoke_segments = list(segments)
+
+        self.points = deque(points, maxlen=max(20000, len(points) + 100))
+        self.offline_mode = True
+        self.offline_duration_s = self.karaoke_audio.duration_s
+        self.offline_cursor_s = 0.0
+        self.current_point = self._point_at_time(0.0)
+        self.karaoke_timeline_var.set(0.0)
+        try:
+            self.karaoke_scale.configure(to=max(0.001, self.offline_duration_s))
+        except Exception:
+            pass
+
+        self.karaoke_status_var.set(
+            f"Karaoke: {len(points)} frames | {len(segments)} segmentos | {self._offline_info_label(info)}"
+        )
+        self.audio_status_var.set("Karaoke: análisis listo; puedes guardar .pvk")
+        self._update_karaoke_panel_state(force=True)
+
+    def _save_karaoke_project(self) -> None:
+        if self.karaoke_project is None or not self.karaoke_project.frames:
+            messagebox.showinfo("Karaoke", "No hay proyecto analizado para guardar. Carga audio y analiza la pista.", parent=self)
+            return
+
+        title = simpledialog.askstring(
+            "Título",
+            "Título de la canción:",
+            initialvalue=self.karaoke_project.title or "Canción",
+            parent=self,
+        )
+        if title is not None:
+            self.karaoke_project.title = title.strip() or self.karaoke_project.title
+
+        artist = simpledialog.askstring(
+            "Artista",
+            "Artista/intérprete (opcional):",
+            initialvalue=self.karaoke_project.artist,
+            parent=self,
+        )
+        if artist is not None:
+            self.karaoke_project.artist = artist.strip()
+
+        path = filedialog.asksaveasfilename(
+            title="Guardar proyecto Pitch Viewer Karaoke",
+            defaultextension=".pvk",
+            filetypes=[("Pitch Viewer Karaoke", "*.pvk"), ("Todos los archivos", "*.*")],
+            initialfile=f"{self.karaoke_project.title or 'cancion'}.pvk",
+            parent=self,
+        )
+        if not path:
+            return
+
+        try:
+            saved = save_pvk(self.karaoke_project, path)
+        except Exception as exc:
+            messagebox.showerror("Karaoke", f"No se pudo guardar el .pvk:\n\n{exc}", parent=self)
+            return
+
+        self.karaoke_status_var.set(f"Guardado: {saved.name}")
+        self.audio_status_var.set(f"Karaoke: guardado {saved}")
+        messagebox.showinfo("Karaoke", f"Proyecto guardado:\n{saved}", parent=self)
+
+    def _export_karaoke_segments_csv(self) -> None:
+        if not self.karaoke_segments:
+            messagebox.showinfo("Karaoke", "No hay segmentos para exportar.", parent=self)
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Exportar segmentos karaoke CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Todos los archivos", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["start_s", "end_s", "duration_s", "midi", "note", "mean_cents", "confidence", "rms", "frame_count"])
+                for segment in self.karaoke_segments:
+                    writer.writerow([
+                        f"{segment.start_s:.6f}",
+                        f"{segment.end_s:.6f}",
+                        f"{segment.duration_s:.6f}",
+                        int(segment.midi),
+                        segment.note,
+                        f"{segment.mean_cents:.6f}",
+                        f"{segment.confidence:.6f}",
+                        f"{segment.rms:.6f}",
+                        int(segment.frame_count),
+                    ])
+        except Exception as exc:
+            messagebox.showerror("Karaoke", f"No se pudo exportar CSV:\n\n{exc}", parent=self)
+            return
+
+        messagebox.showinfo("Karaoke", f"Segmentos exportados:\n{path}", parent=self)
+
+    def _set_karaoke_cursor_from_slider(self, value) -> None:
+        if self.karaoke_timeline_updating:
+            return
+        try:
+            cursor = float(value)
+        except Exception:
+            return
+        duration = self.karaoke_audio.duration_s if self.karaoke_audio is not None else self.offline_duration_s
+        if duration <= 0:
+            return
+        self.offline_mode = True
+        self.offline_duration_s = max(self.offline_duration_s, duration)
+        self.offline_cursor_s = max(0.0, min(duration, cursor))
+        self.current_point = self._point_at_time(self.offline_cursor_s)
+        self._update_karaoke_panel_state(force=True)
+
+    def _jump_karaoke_start(self) -> None:
+        self.offline_mode = True
+        self.offline_cursor_s = 0.0
+        self.current_point = self._point_at_time(0.0)
+        self._update_karaoke_panel_state(force=True)
+
+    def _jump_karaoke_end(self) -> None:
+        duration = self.karaoke_audio.duration_s if self.karaoke_audio is not None else self.offline_duration_s
+        self.offline_mode = True
+        self.offline_duration_s = duration
+        self.offline_cursor_s = duration
+        self.current_point = self._point_at_time(duration)
+        self._update_karaoke_panel_state(force=True)
+
+    def _update_karaoke_panel_state(self, force: bool = False) -> None:
+        duration = self.karaoke_audio.duration_s if self.karaoke_audio is not None else self.offline_duration_s
+        if duration <= 0:
+            self.karaoke_time_var.set("00:00.000 / 00:00.000")
+            self.karaoke_current_lyric_var.set("")
+            return
+
+        cursor = self.offline_cursor_s if self.offline_mode else self._display_time_s()
+        cursor = max(0.0, min(duration, cursor))
+        self.karaoke_time_var.set(f"{self._format_time(cursor)} / {self._format_time(duration)}")
+
+        if self.karaoke_lyrics_lines:
+            self.karaoke_current_lyric_var.set(current_lyric_line(self.karaoke_lyrics_lines, cursor))
+        else:
+            self.karaoke_current_lyric_var.set("")
+
+        if self.karaoke_panel_visible or force:
+            try:
+                self.karaoke_timeline_updating = True
+                self.karaoke_scale.configure(to=max(0.001, duration))
+                self.karaoke_timeline_var.set(cursor)
+            finally:
+                self.karaoke_timeline_updating = False
+
+    def _draw_karaoke_segments(
+        self,
+        canvas: tk.Canvas,
+        settings: AppSettings,
+        palette: dict[str, str],
+        plot_left: int,
+        plot_right: int,
+        plot_top: int,
+        plot_bottom: int,
+        visible_min_midi: int,
+        visible_max_midi: int,
+        midi_to_y: Callable[[float], float],
+    ) -> None:
+        if not self.karaoke_segments:
+            return
+
+        now = self._display_time_s()
+        window_s = float(settings.time_window_s)
+        visible_start = now - window_s
+        plot_width = plot_right - plot_left
+        tolerance = settings.tolerance_cents / 100.0
+
+        target_fill = "#2563eb" if settings.theme_name == "dark" else "#60a5fa"
+        target_outline = "#93c5fd" if settings.theme_name == "dark" else "#1d4ed8"
+
+        for segment in self.karaoke_segments:
+            if segment.end_s < visible_start or segment.start_s > now:
+                continue
+            if not (visible_min_midi <= segment.midi <= visible_max_midi):
+                continue
+
+            x1 = plot_left + ((max(segment.start_s, visible_start) - visible_start) / window_s) * plot_width
+            x2 = plot_left + ((min(segment.end_s, now) - visible_start) / window_s) * plot_width
+            if x2 - x1 < 2.0:
+                x2 = x1 + 2.0
+            y1 = max(plot_top, min(plot_bottom, midi_to_y(segment.midi + tolerance)))
+            y2 = max(plot_top, min(plot_bottom, midi_to_y(segment.midi - tolerance)))
+
+            canvas.create_rectangle(
+                x1,
+                y1,
+                x2,
+                y2,
+                fill=target_fill,
+                outline=target_outline,
+                width=1,
+                stipple="gray25",
+            )
+            if x2 - x1 >= 44:
+                canvas.create_text(
+                    (x1 + x2) / 2.0,
+                    (y1 + y2) / 2.0,
+                    text=segment.note,
+                    fill=palette["text"],
+                    font=("TkDefaultFont", 8, "bold"),
+                    anchor="center",
+                )
+
     def _show_backend_runtime_report(self) -> None:
         try:
             from .detection.offline_torchcrepe import torchcrepe_available
@@ -3238,8 +3736,8 @@ class PitchViewerApp(tk.Tk):
     def _show_about(self) -> None:
         messagebox.showinfo(
             "Acerca de",
-            "Monitor de afinación vocal - v0.8.2\n\n"
-            "Incluye calibración de micrófono/voz, presets de estabilidad y backends separados para vivo/offline.\n"
+            "Monitor de afinación vocal - v0.9.0\n\n"
+            "Incluye karaoke producción: carga de pista vocal, análisis offline, letras y guardado .pvk.\n"
             "Si no hay CUDA, Torchcrepe full queda deshabilitado en vivo, pero sigue disponible como backend offline/record seleccionable.\n"
             "La configuración guarda también el backend seleccionado.\n\n"
             f"Archivo de configuración:\n{self.settings_path}",
