@@ -1,0 +1,4 @@
+# Dependencias opcionales para separación vocal/instrumental con IA.
+# Recomendado en Ubuntu con CUDA. En Windows CPU funciona, pero puede tardar bastante.
+demucs
+soundfile

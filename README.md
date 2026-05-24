@@ -1,63 +1,65 @@
-# Pitch Viewer v0.9.1
+# Pitch Viewer v0.9.3
 
-Monitor de afinación vocal en escritorio con Tkinter.
+Monitor de afinación vocal en Python/Tkinter con modo karaoke producción y separación IA opcional.
 
-## Ejecución
+## Ejecutar
 
 ```bash
+cd "E:\\Felpipe\\Proyectos propios\\PitchViewer"
 pip install -r requirements.txt
-python main.py
+python .\main.py
 ```
 
-Para usar Torchcrepe:
+## Dependencias opcionales
+
+Backends Torchcrepe:
 
 ```bash
 pip install -r optional-requirements-torchcrepe.txt
 ```
 
-## Karaoke producción
+Separación IA con Demucs:
 
-La v0.9.1 mantiene la creación de proyectos karaoke `.pvk` y mueve el panel de letras al costado derecho. Los controles de producción y la línea de tiempo quedan en la franja inferior.
-
-Flujo básico:
-
-1. `Karaoke > Nuevo proyecto desde audio...`
-2. Cargar una pista vocal. Recomendado en esta etapa: `.wav`.
-3. Opcional: `Karaoke > Importar letra...` con `.txt` o `.lrc`.
-4. Elegir backend offline en `Audio > Backend offline / record`.
-5. `Karaoke > Analizar pista vocal`.
-6. Revisar los bloques de segmentos en el piano-roll y navegar con el slider del panel karaoke.
-7. `Karaoke > Guardar proyecto .pvk...`.
-
-El `.pvk` es un ZIP con:
-
-```text
-manifest.json
-settings_snapshot.json
-pitch_frames.csv
-note_segments.json
-lyrics.txt    opcional
-lyrics.lrc    opcional
+```bash
+pip install -r optional-requirements-separation.txt
 ```
 
-## Formatos de audio
+En Windows sin CUDA, Demucs y Torchcrepe full pueden correr en CPU, pero pueden tardar bastante. En Ubuntu con CUDA, la app detecta CUDA al iniciar y reutiliza ese estado cacheado para Torchcrepe y Demucs.
 
-- WAV: soporte principal.
-- FLAC/OGG/otros: pueden funcionar si `soundfile`/libsndfile los soporta.
-- MP3/MP4/M4A: se intenta usar `ffmpeg` si está disponible en PATH.
+## Cambios v0.9.3
 
-Para archivos multicanal, el programa permite elegir:
+- Nuevo panel escondible de **Separación IA**.
+- Nuevo menú `Separación IA`.
+- Integración opcional con Demucs vía `python -m demucs`.
+- Separación de canción/mezcla en stems.
+- Barra de progreso/estado para separación.
+- Barras de ganancia por pista detectada:
+  - voz;
+  - batería;
+  - bajo;
+  - otros instrumentos;
+  - instrumental, en modo 2 stems.
+- Exportación de mezcla WAV con ganancias ajustadas.
+- Carga directa de `vocals.wav` como pista de karaoke producción.
+- Estado CUDA centralizado al inicio de la app en `runtime.py`.
 
-```text
-mix      promedio mono
-left     canal izquierdo
-right    canal derecho
-max_rms  canal con mayor energía RMS
+## Flujo sugerido para separación + karaoke
+
+1. `Separación IA > Mostrar/ocultar panel separación IA`.
+2. `Abrir mezcla...`.
+3. Elegir modelo y salida:
+   - `htdemucs` + `4stems` por defecto;
+   - `2stems` si solo quieres `vocals` y `no_vocals`.
+4. `Separar con Demucs`.
+5. Ajustar ganancias si quieres exportar una mezcla.
+6. `Usar voz en karaoke`.
+7. `Karaoke > Analizar pista vocal`.
+8. Guardar `.pvk`.
+
+## Commit sugerido
+
+```bash
+git add .
+git commit -m "feat: add AI source separation panel"
+git tag v0.9.3
 ```
-
-## Backends
-
-- En vivo: se usa `Audio > Backend en vivo`.
-- Offline/record/karaoke producción: se usa `Audio > Backend offline / record`.
-
-Torchcrepe full queda deshabilitado para tiempo real si no hay CUDA, pero sigue disponible para análisis offline en CPU.

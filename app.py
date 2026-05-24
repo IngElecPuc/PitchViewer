@@ -47,6 +47,15 @@ from .karaoke.audio_loader import LoadedAudio, load_audio_file
 from .karaoke.lyrics import LyricsLine, current_lyric_line, load_lyrics_file
 from .karaoke.models import KaraokeAudioInfo, KaraokeProject, KaraokeNoteSegment
 from .karaoke.project_file import save_pvk
+from .runtime import RUNTIME_INFO
+from .separation.demucs_separator import (
+    STEM_DISPLAY_NAMES,
+    default_separation_dir,
+    export_mix_with_gains,
+    is_demucs_available,
+    run_demucs_separation,
+)
+from .separation.models import SeparationResult
 from .detection.registry import (
     BACKENDS,
     BACKEND_AUTOCORRELATION,
@@ -85,7 +94,7 @@ class PitchViewerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
 
-        self.title("Monitor de afinación vocal - v0.9.0")
+        self.title("Monitor de afinación vocal - v0.9.3")
 
         self.settings_load_result = load_settings()
         self.settings = self.settings_load_result.settings
@@ -109,7 +118,8 @@ class PitchViewerApp(tk.Tk):
         self.frame_size = 4096
         self.pitch_detector = None
         self.active_backend_id = normalize_backend_id(self.settings.detector_backend)
-        self.cuda_available = self._detect_cuda_available()
+        self.runtime_info = RUNTIME_INFO
+        self.cuda_available = self.runtime_info.cuda_available
         self.torchcrepe_full_realtime_enabled = self.cuda_available
         if (
             not self.torchcrepe_full_realtime_enabled
@@ -181,6 +191,23 @@ class PitchViewerApp(tk.Tk):
         self.karaoke_status_var = tk.StringVar(value="Karaoke: sin pista cargada")
         self.karaoke_time_var = tk.StringVar(value="00:00.000 / 00:00.000")
         self.karaoke_current_lyric_var = tk.StringVar(value="")
+        self.karaoke_progress_var = tk.DoubleVar(value=0.0)
+        self.karaoke_progress_text_var = tk.StringVar(value="Progreso: —")
+
+        self.separation_panel_visible = False
+        self.separation_source_path: Optional[str] = None
+        self.separation_result: Optional[SeparationResult] = None
+        self.separation_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.separation_running = False
+        self.separation_output_root = default_separation_dir()
+        self.separation_model_var = tk.StringVar(value="htdemucs")
+        self.separation_mode_var = tk.StringVar(value="4stems")
+        self.separation_device_var = tk.StringVar(value="cuda" if self.cuda_available else "cpu")
+        self.separation_status_var = tk.StringVar(value="Separación IA: sin mezcla cargada")
+        self.separation_progress_var = tk.DoubleVar(value=0.0)
+        self.separation_progress_text_var = tk.StringVar(value="Progreso: —")
+        self.separation_stem_gain_vars: dict[str, tk.DoubleVar] = {}
+        self.separation_stem_rows: dict[str, ttk.Frame] = {}
 
         self.note_status_var = tk.StringVar(value="Nota: —")
         self.freq_status_var = tk.StringVar(value="Frecuencia: —")
@@ -206,12 +233,7 @@ class PitchViewerApp(tk.Tk):
 
     @staticmethod
     def _detect_cuda_available() -> bool:
-        try:
-            import torch  # type: ignore
-
-            return bool(torch.cuda.is_available())
-        except Exception:
-            return False
+        return bool(RUNTIME_INFO.cuda_available)
 
     def _is_realtime_backend_enabled(self, backend_id: str) -> bool:
         backend_id = normalize_backend_id(backend_id)
@@ -459,6 +481,16 @@ class PitchViewerApp(tk.Tk):
         karaoke_menu.add_command(label="Exportar segmentos CSV...", command=self._export_karaoke_segments_csv)
         menubar.add_cascade(label="Karaoke", menu=karaoke_menu)
 
+        separation_menu = tk.Menu(menubar, tearoff=False)
+        separation_menu.add_command(label="Mostrar/ocultar panel separación IA", command=self._toggle_separation_panel)
+        separation_menu.add_separator()
+        separation_menu.add_command(label="Abrir canción/mezcla...", command=self._load_separation_source)
+        separation_menu.add_command(label="Separar pistas con Demucs", command=self._start_ai_separation)
+        separation_menu.add_separator()
+        separation_menu.add_command(label="Usar stem de voz como pista karaoke", command=self._use_vocals_stem_for_karaoke)
+        separation_menu.add_command(label="Exportar mezcla con ganancias...", command=self._export_separation_mix)
+        menubar.add_cascade(label="Separación IA", menu=separation_menu)
+
         help_menu = tk.Menu(menubar, tearoff=False)
         help_menu.add_command(label="Acerca de", command=self._show_about)
         menubar.add_cascade(label="Ayuda", menu=help_menu)
@@ -544,11 +576,12 @@ class PitchViewerApp(tk.Tk):
         self.canvas.bind("<ButtonRelease-3>", self._on_range_drag_end)
 
         self._build_karaoke_panel(root)
+        self._build_separation_panel(root)
 
         self.footer = ttk.Label(
             root,
             text=(
-                "v0.9.1: karaoke producción (.pvk), análisis offline de pista vocal y letras. "
+                "v0.9.3: karaoke producción + separación IA opcional con Demucs. "
                 "La letra se despliega al lado derecho al activar Karaoke."
             ),
             anchor="w",
@@ -1169,7 +1202,7 @@ class PitchViewerApp(tk.Tk):
                 f"Offline: {len(points)} puntos | {self._offline_info_label(info)} | duración {duration_s:.1f}s"
             )
 
-    def _analyze_audio_offline(self, audio: np.ndarray, sample_rate: int):
+    def _analyze_audio_offline(self, audio: np.ndarray, sample_rate: int, progress_callback: Optional[Callable[[float, str], None]] = None):
         """Analiza una grabación con el backend offline seleccionado.
 
         A diferencia del backend vivo, esta ruta no tiene presupuesto temporal
@@ -1180,6 +1213,8 @@ class PitchViewerApp(tk.Tk):
             settings = AppSettings(**self.settings.__dict__)
 
         backend_id = normalize_backend_id(settings.offline_detector_backend)
+        if progress_callback is not None:
+            progress_callback(0.03, f"Backend offline: {backend_label(backend_id)}")
         detect_min_hz = max(MIN_DETECTABLE_HZ, midi_to_freq(settings.min_midi - 8, settings.a4_hz))
         detect_max_hz = min(MAX_DETECTABLE_HZ, midi_to_freq(settings.max_midi + 8, settings.a4_hz))
 
@@ -1191,6 +1226,7 @@ class PitchViewerApp(tk.Tk):
                 backend_id=backend_id,
                 detect_min_hz=detect_min_hz,
                 detect_max_hz=detect_max_hz,
+                progress_callback=progress_callback,
             )
 
         return self._analyze_audio_offline_with_frame_detector(
@@ -1200,6 +1236,7 @@ class PitchViewerApp(tk.Tk):
             backend_id=backend_id,
             detect_min_hz=detect_min_hz,
             detect_max_hz=detect_max_hz,
+            progress_callback=progress_callback,
         )
 
     def _analyze_audio_offline_with_torchcrepe(
@@ -1210,6 +1247,7 @@ class PitchViewerApp(tk.Tk):
         backend_id: str,
         detect_min_hz: float,
         detect_max_hz: float,
+        progress_callback: Optional[Callable[[float, str], None]] = None,
     ):
         from .detection.offline_torchcrepe import analyze_audio_with_torchcrepe
 
@@ -1225,7 +1263,16 @@ class PitchViewerApp(tk.Tk):
             target_sample_rate=16000,
             hop_s=0.05,
             batch_size=64 if model == "full" else 256,
+            chunk_duration_s=20.0,
+            progress_callback=(
+                (lambda fraction, message: progress_callback(0.05 + 0.82 * float(fraction), message))
+                if progress_callback is not None
+                else None
+            ),
         )
+
+        if progress_callback is not None:
+            progress_callback(0.88, "Aplicando filtros de voz")
 
         points = self._offline_torchcrepe_frames_to_points(
             frames=frames,
@@ -1244,6 +1291,7 @@ class PitchViewerApp(tk.Tk):
         backend_id: str,
         detect_min_hz: float,
         detect_max_hz: float,
+        progress_callback: Optional[Callable[[float, str], None]] = None,
     ):
         x = np.asarray(audio, dtype=np.float32)
         if x.ndim != 1:
@@ -1262,7 +1310,14 @@ class PitchViewerApp(tk.Tk):
         else:
             duration_s = float(x.size) / float(max(1, sample_rate))
 
-        for start in range(0, max(1, x.size), hop_size):
+        starts = list(range(0, max(1, x.size), hop_size))
+        total_frames = max(1, len(starts))
+
+        for frame_index, start in enumerate(starts):
+            if progress_callback is not None and (frame_index == 0 or frame_index % 20 == 0 or frame_index == total_frames - 1):
+                fraction = 0.05 + 0.82 * (float(frame_index) / float(max(1, total_frames - 1)))
+                progress_callback(fraction, f"Analizando frame {frame_index + 1}/{total_frames}")
+
             frame = x[start:start + frame_size]
             if frame.size == 0:
                 continue
@@ -1636,6 +1691,7 @@ class PitchViewerApp(tk.Tk):
         self._consume_offline_analysis_results()
         self._consume_calibration_results()
         self._consume_karaoke_analysis_results()
+        self._consume_separation_results()
         self._consume_pitch_points()
         self._update_karaoke_panel_state()
         self._update_status()
@@ -2905,6 +2961,322 @@ class PitchViewerApp(tk.Tk):
         return nearest_midi
 
 
+    def _build_separation_panel(self, parent: tk.Widget) -> None:
+        self.separation_panel = ttk.LabelFrame(parent, text="Separación IA", padding=8)
+
+        controls = ttk.Frame(self.separation_panel)
+        controls.pack(fill=tk.X, side=tk.TOP)
+
+        ttk.Button(controls, text="Abrir mezcla...", command=self._load_separation_source).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(controls, text="Separar con Demucs", command=self._start_ai_separation).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(controls, text="Usar voz en karaoke", command=self._use_vocals_stem_for_karaoke).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(controls, text="Exportar mezcla...", command=self._export_separation_mix).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(controls, textvariable=self.separation_status_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        options = ttk.Frame(self.separation_panel)
+        options.pack(fill=tk.X, side=tk.TOP, pady=(8, 0))
+
+        ttk.Label(options, text="Modelo:").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Combobox(
+            options,
+            textvariable=self.separation_model_var,
+            values=["htdemucs", "htdemucs_ft"],
+            state="readonly",
+            width=14,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(options, text="Salida:").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Combobox(
+            options,
+            textvariable=self.separation_mode_var,
+            values=["4stems", "2stems"],
+            state="readonly",
+            width=10,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(options, text="Device:").pack(side=tk.LEFT, padx=(0, 4))
+        device_values = ["cpu"]
+        if self.cuda_available:
+            device_values = ["cuda", "cpu"]
+        ttk.Combobox(
+            options,
+            textvariable=self.separation_device_var,
+            values=device_values,
+            state="readonly",
+            width=8,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
+        cuda_text = "CUDA: sí"
+        if self.cuda_available and self.runtime_info.cuda_device_name:
+            cuda_text = f"CUDA: sí | {self.runtime_info.cuda_device_name}"
+        elif not self.cuda_available:
+            cuda_text = "CUDA: no | Demucs correrá en CPU"
+        ttk.Label(options, text=(cuda_text if len(cuda_text) <= 70 else cuda_text[:67] + "...")).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        progress_row = ttk.Frame(self.separation_panel)
+        progress_row.pack(fill=tk.X, side=tk.TOP, pady=(8, 0))
+        ttk.Label(progress_row, textvariable=self.separation_progress_text_var, width=38, anchor="w").pack(side=tk.LEFT, padx=(0, 8))
+        self.separation_progress_bar = ttk.Progressbar(
+            progress_row,
+            orient=tk.HORIZONTAL,
+            mode="determinate",
+            variable=self.separation_progress_var,
+            maximum=100.0,
+        )
+        self.separation_progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.separation_stems_frame = ttk.LabelFrame(self.separation_panel, text="Ganancia por pista detectada", padding=8)
+        self.separation_stems_frame.pack(fill=tk.X, side=tk.TOP, pady=(8, 0))
+        ttk.Label(
+            self.separation_stems_frame,
+            text="Después de separar, ajusta las ganancias: 100% conserva, 0% silencia.",
+        ).pack(anchor="w")
+
+    def _toggle_separation_panel(self) -> None:
+        if self.separation_panel_visible:
+            self.separation_panel.pack_forget()
+            self.separation_panel_visible = False
+            return
+        self._show_separation_panel()
+
+    def _show_separation_panel(self) -> None:
+        if not self.separation_panel_visible:
+            self.separation_panel.pack(fill=tk.X, side=tk.BOTTOM, before=self.footer, pady=(8, 0))
+            self.separation_panel_visible = True
+
+    def _load_separation_source(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Abrir canción o mezcla para separar",
+            filetypes=[
+                ("Audio", "*.wav *.flac *.ogg *.mp3 *.m4a *.mp4"),
+                ("WAV", "*.wav"),
+                ("Todos los archivos", "*.*"),
+            ],
+            parent=self,
+        )
+        if not path:
+            return
+        self.separation_source_path = path
+        self.separation_result = None
+        self._clear_separation_stem_sliders()
+        self._set_separation_progress(0.0, "Progreso: mezcla cargada")
+        self.separation_status_var.set(f"Separación IA: {os.path.basename(path)}")
+        self.audio_status_var.set("Separación IA: mezcla cargada; falta separar pistas")
+        self._show_separation_panel()
+
+    def _start_ai_separation(self) -> None:
+        if self.separation_running:
+            messagebox.showinfo("Separación IA", "Ya hay una separación en curso.", parent=self)
+            return
+        if not self.separation_source_path:
+            messagebox.showinfo("Separación IA", "Primero abre una canción o mezcla.", parent=self)
+            self._show_separation_panel()
+            return
+        if not is_demucs_available():
+            messagebox.showerror(
+                "Separación IA",
+                "Demucs no está instalado. Instala las dependencias opcionales:\n\n"
+                "pip install -r optional-requirements-separation.txt",
+                parent=self,
+            )
+            self._show_separation_panel()
+            return
+
+        self.separation_running = True
+        self.separation_result = None
+        self._clear_separation_stem_sliders()
+        self._set_separation_progress(0.01, "Progreso: preparando Demucs")
+        self.separation_status_var.set("Separación IA: ejecutando Demucs")
+        self.audio_status_var.set("Separación IA: proceso en curso")
+        self._show_separation_panel()
+
+        thread = threading.Thread(target=self._separation_worker, daemon=True)
+        thread.start()
+
+    def _separation_worker(self) -> None:
+        try:
+            source_path = str(self.separation_source_path or "")
+            model_name = str(self.separation_model_var.get() or "htdemucs")
+            mode = str(self.separation_mode_var.get() or "4stems")
+            requested_device = str(self.separation_device_var.get() or "cpu").lower()
+            device = "cuda" if requested_device.startswith("cuda") and self.cuda_available else "cpu"
+
+            def report(fraction: float, message: str) -> None:
+                self.separation_queue.put(("progress", {"fraction": float(fraction), "message": str(message)}))
+
+            result = run_demucs_separation(
+                input_path=source_path,
+                output_root=self.separation_output_root,
+                model_name=model_name,
+                device=device,
+                mode=mode,
+                progress_callback=report,
+            )
+            self.separation_queue.put(("ok", result))
+        except Exception as exc:
+            self.separation_queue.put(("error", f"{type(exc).__name__}: {exc}"))
+
+    def _consume_separation_results(self) -> None:
+        while True:
+            try:
+                status, payload = self.separation_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if status == "progress":
+                data = payload if isinstance(payload, dict) else {}
+                fraction = float(data.get("fraction", 0.0))
+                message = str(data.get("message", "Procesando"))
+                self._set_separation_progress(fraction, message)
+                self.separation_status_var.set(message)
+                continue
+
+            self.separation_running = False
+            if status == "error":
+                self._set_separation_progress(0.0, "Progreso: error de separación")
+                self.separation_status_var.set("Separación IA: error")
+                self.audio_status_var.set("Separación IA: error")
+                messagebox.showerror("Separación IA", f"No se pudo separar la canción:\n\n{payload}", parent=self)
+                return
+
+            result = payload
+            if not isinstance(result, SeparationResult):
+                self._set_separation_progress(0.0, "Progreso: resultado inválido")
+                return
+
+            self.separation_result = result
+            self._set_separation_progress(1.0, "Progreso: separación completa")
+            stems_text = ", ".join(sorted(result.stems))
+            self.separation_status_var.set(
+                f"Separación IA: {len(result.stems)} pistas | {stems_text} | {result.device}"
+            )
+            self.audio_status_var.set("Separación IA: separación lista; ajusta ganancias o usa voz en karaoke")
+            self._refresh_separation_stem_sliders()
+
+    def _set_separation_progress(self, fraction: float, message: str) -> None:
+        percent = max(0.0, min(100.0, 100.0 * float(fraction)))
+        self.separation_progress_var.set(percent)
+        if percent <= 0.0:
+            self.separation_progress_text_var.set(str(message))
+        elif percent >= 100.0:
+            self.separation_progress_text_var.set(f"{message} | 100%")
+        else:
+            self.separation_progress_text_var.set(f"{message} | {percent:0.1f}%")
+
+    def _clear_separation_stem_sliders(self) -> None:
+        if not hasattr(self, "separation_stems_frame"):
+            return
+        for row in list(self.separation_stem_rows.values()):
+            try:
+                row.destroy()
+            except Exception:
+                pass
+        self.separation_stem_rows.clear()
+        self.separation_stem_gain_vars.clear()
+
+    def _refresh_separation_stem_sliders(self) -> None:
+        self._clear_separation_stem_sliders()
+        if self.separation_result is None:
+            return
+
+        for stem_name in sorted(self.separation_result.stems):
+            stem = self.separation_result.stems[stem_name]
+            row = ttk.Frame(self.separation_stems_frame)
+            row.pack(fill=tk.X, side=tk.TOP, pady=(4, 0))
+            label = STEM_DISPLAY_NAMES.get(stem_name, stem_name)
+            ttk.Label(row, text=f"{label}:", width=18, anchor="w").pack(side=tk.LEFT)
+            var = tk.DoubleVar(value=100.0)
+            self.separation_stem_gain_vars[stem_name] = var
+            ttk.Scale(row, from_=0.0, to=150.0, orient=tk.HORIZONTAL, variable=var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+            value_label = ttk.Label(row, text="100%", width=7, anchor="e")
+            value_label.pack(side=tk.LEFT)
+
+            def update_label(_value=None, variable=var, label_widget=value_label) -> None:
+                label_widget.configure(text=f"{float(variable.get()):0.0f}%")
+
+            var.trace_add("write", lambda *_args, callback=update_label: callback())
+            ttk.Label(
+                row,
+                text=f"{stem.duration_s:.1f}s | {stem.sample_rate} Hz | {stem.channels} ch",
+                width=26,
+                anchor="e",
+            ).pack(side=tk.LEFT, padx=(8, 0))
+            self.separation_stem_rows[stem_name] = row
+
+    def _use_vocals_stem_for_karaoke(self) -> None:
+        if self.separation_result is None or "vocals" not in self.separation_result.stems:
+            messagebox.showinfo("Separación IA", "No hay stem vocals disponible. Primero separa una canción.", parent=self)
+            return
+
+        vocals = self.separation_result.stems["vocals"]
+        try:
+            loaded = load_audio_file(str(vocals.path), selected_channel="mix")
+        except Exception as exc:
+            messagebox.showerror("Separación IA", f"No se pudo cargar vocals.wav como pista karaoke:\n\n{exc}", parent=self)
+            return
+
+        self.karaoke_audio = loaded
+        self.karaoke_segments = []
+        self.karaoke_project = KaraokeProject(
+            title=os.path.splitext(loaded.filename)[0],
+            artist="",
+            audio_info=KaraokeAudioInfo(
+                path=loaded.path,
+                filename=loaded.filename,
+                sample_rate=loaded.sample_rate,
+                channels=loaded.channels,
+                selected_channel=loaded.selected_channel,
+                duration_s=loaded.duration_s,
+            ),
+        )
+        self.points.clear()
+        self.current_point = None
+        self.offline_mode = True
+        self.offline_duration_s = loaded.duration_s
+        self.offline_cursor_s = 0.0
+        self.karaoke_timeline_var.set(0.0)
+        try:
+            self.karaoke_scale.configure(to=max(0.001, loaded.duration_s))
+        except Exception:
+            pass
+        self.karaoke_status_var.set(
+            f"Audio desde separación IA: {loaded.filename} | {loaded.sample_rate} Hz | {loaded.duration_s:.1f}s"
+        )
+        self._set_karaoke_progress(0.0, "Progreso: stem de voz cargado, falta analizar")
+        self.audio_status_var.set("Karaoke: stem de voz cargado desde separación IA")
+        self._show_karaoke_panel()
+        self._update_karaoke_panel_state(force=True)
+
+    def _export_separation_mix(self) -> None:
+        if self.separation_result is None:
+            messagebox.showinfo("Separación IA", "No hay stems para mezclar. Primero separa una canción.", parent=self)
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Exportar mezcla con ganancias",
+            defaultextension=".wav",
+            filetypes=[("WAV", "*.wav"), ("Todos los archivos", "*.*")],
+            initialfile="pitchviewer_mix.wav",
+            parent=self,
+        )
+        if not path:
+            return
+
+        gains = {
+            name: max(0.0, float(var.get()) / 100.0)
+            for name, var in self.separation_stem_gain_vars.items()
+        }
+        try:
+            saved = export_mix_with_gains(self.separation_result, gains, path)
+        except Exception as exc:
+            messagebox.showerror("Separación IA", f"No se pudo exportar la mezcla:\n\n{exc}", parent=self)
+            return
+
+        self.separation_status_var.set(f"Mezcla exportada: {saved.name}")
+        self.audio_status_var.set(f"Separación IA: mezcla exportada {saved}")
+        messagebox.showinfo("Separación IA", f"Mezcla exportada:\n{saved}", parent=self)
+
+
     def _build_karaoke_panel(self, parent: tk.Widget) -> None:
         self.karaoke_panel = ttk.LabelFrame(parent, text="Karaoke producción", padding=8)
 
@@ -2917,6 +3289,18 @@ class PitchViewerApp(tk.Tk):
         ttk.Button(controls, text="Guardar .pvk...", command=self._save_karaoke_project).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(controls, textvariable=self.karaoke_status_var).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(controls, textvariable=self.karaoke_time_var).pack(side=tk.RIGHT)
+
+        progress_row = ttk.Frame(self.karaoke_panel)
+        progress_row.pack(fill=tk.X, side=tk.TOP, pady=(8, 0))
+        ttk.Label(progress_row, textvariable=self.karaoke_progress_text_var, width=34, anchor="w").pack(side=tk.LEFT, padx=(0, 8))
+        self.karaoke_progress_bar = ttk.Progressbar(
+            progress_row,
+            orient=tk.HORIZONTAL,
+            mode="determinate",
+            variable=self.karaoke_progress_var,
+            maximum=100.0,
+        )
+        self.karaoke_progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         timeline = ttk.Frame(self.karaoke_panel)
         timeline.pack(fill=tk.X, side=tk.TOP, pady=(8, 4))
@@ -3053,6 +3437,7 @@ class PitchViewerApp(tk.Tk):
         self.karaoke_status_var.set(
             f"Audio: {loaded.filename} | {loaded.sample_rate} Hz | {loaded.duration_s:.1f}s | canal {loaded.selected_channel}"
         )
+        self._set_karaoke_progress(0.0, "Progreso: pista cargada, falta analizar")
         self.audio_status_var.set("Karaoke: audio cargado; falta analizar pista")
         self._show_karaoke_panel()
         self._update_karaoke_panel_state(force=True)
@@ -3104,6 +3489,7 @@ class PitchViewerApp(tk.Tk):
             return
 
         self.karaoke_analysis_running = True
+        self._set_karaoke_progress(0.0, "Progreso: preparando análisis")
         with self.settings_lock:
             backend_id = normalize_backend_id(self.settings.offline_detector_backend)
         self.audio_status_var.set(
@@ -3120,12 +3506,23 @@ class PitchViewerApp(tk.Tk):
         thread.start()
 
     def _karaoke_analysis_worker(self, audio: np.ndarray, sample_rate: int) -> None:
+        def progress_callback(fraction: float, message: str) -> None:
+            safe_fraction = max(0.0, min(1.0, float(fraction)))
+            self.karaoke_analysis_queue.put((
+                "progress",
+                {"fraction": safe_fraction, "message": str(message)},
+            ))
+
         try:
-            points, info = self._analyze_audio_offline(audio, sample_rate)
+            progress_callback(0.01, "Preparando detector offline")
+            points, info = self._analyze_audio_offline(audio, sample_rate, progress_callback=progress_callback)
+            progress_callback(0.90, "Convirtiendo frames de pitch")
             with self.settings_lock:
                 settings = AppSettings(**self.settings.__dict__)
             frames = pitch_points_to_frames(points)
+            progress_callback(0.94, "Construyendo segmentos de notas")
             segments = build_note_segments(points, settings)
+            progress_callback(0.98, "Preparando proyecto .pvk")
             snapshot = settings_snapshot(settings)
             payload = (points, frames, segments, snapshot, info)
             self.karaoke_analysis_queue.put(("ok", payload))
@@ -3139,15 +3536,35 @@ class PitchViewerApp(tk.Tk):
             except queue.Empty:
                 break
 
+            if status == "progress":
+                data = payload if isinstance(payload, dict) else {}
+                fraction = float(data.get("fraction", 0.0))
+                message = str(data.get("message", "Analizando"))
+                self._set_karaoke_progress(fraction, message)
+                self.karaoke_status_var.set(message)
+                continue
+
             self.karaoke_analysis_running = False
             if status == "error":
+                self._set_karaoke_progress(0.0, "Progreso: error de análisis")
                 self.karaoke_status_var.set("Karaoke: error de análisis")
                 self.audio_status_var.set("Karaoke: error de análisis")
                 messagebox.showerror("Karaoke", f"No se pudo analizar la pista:\n\n{payload}", parent=self)
                 return
 
             points, frames, segments, snapshot, info = payload  # type: ignore[misc]
+            self._set_karaoke_progress(1.0, "Progreso: análisis completo")
             self._apply_karaoke_analysis_result(points, frames, segments, snapshot, info)
+
+    def _set_karaoke_progress(self, fraction: float, message: str) -> None:
+        percent = max(0.0, min(100.0, 100.0 * float(fraction)))
+        self.karaoke_progress_var.set(percent)
+        if percent <= 0.0:
+            self.karaoke_progress_text_var.set(str(message))
+        elif percent >= 100.0:
+            self.karaoke_progress_text_var.set(f"{message} | 100%")
+        else:
+            self.karaoke_progress_text_var.set(f"{message} | {percent:0.1f}%")
 
     def _apply_karaoke_analysis_result(self, points, frames, segments, snapshot, info) -> None:
         if self.karaoke_audio is None:
@@ -3388,18 +3805,23 @@ class PitchViewerApp(tk.Tk):
         cuda_text = "sí" if self.cuda_available else "no"
         realtime_full = "habilitado" if self.torchcrepe_full_realtime_enabled else "deshabilitado"
         torchcrepe_text = "disponible" if available else f"no disponible: {error}"
+        demucs_text = "disponible" if is_demucs_available() else "no disponible"
+        device_name = self.runtime_info.cuda_device_name or "—"
 
         messagebox.showinfo(
-            "Estado Torchcrepe / CUDA",
+            "Estado runtime / CUDA",
             "Estado de backends pesados:\n\n"
-            f"Torchcrepe: {torchcrepe_text}\n"
+            f"Torch: {self.runtime_info.torch_version}\n"
             f"CUDA detectada: {cuda_text}\n"
-            f"Torchcrepe full en vivo: {realtime_full}\n\n"
+            f"Dispositivo CUDA: {device_name}\n"
+            f"Torchcrepe: {torchcrepe_text}\n"
+            f"Torchcrepe full en vivo: {realtime_full}\n"
+            f"Demucs: {demucs_text}\n\n"
             "Regla actual:\n"
+            "- La detección CUDA se realiza una vez al iniciar la app y queda cacheada.\n"
             "- Torchcrepe full se puede usar en vivo solo con CUDA.\n"
             "- El backend offline se elige libremente desde Audio > Backend offline / record.\n"
-            "- Torchcrepe full se puede usar offline con ⏺ Record aunque no haya CUDA.\n"
-            "- Torchcrepe tiny, YIN CMND y Autocorrelación siguen disponibles para tiempo real.",
+            "- Separación IA usa CUDA si está disponible; si no, CPU.",
             parent=self,
         )
 

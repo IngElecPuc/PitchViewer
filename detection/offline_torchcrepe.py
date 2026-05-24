@@ -3,17 +3,20 @@
 """Análisis offline de pitch con Torchcrepe.
 
 Este módulo no se usa para el flujo vivo. Está pensado para grabaciones o,
-más adelante, para karaoke producción. Ejecuta CREPE sobre todo el audio y
-devuelve una secuencia temporal de frecuencia/confianza.
+más adelante, para karaoke producción. Ejecuta CREPE sobre audio completo o por
+bloques, y devuelve una secuencia temporal de frecuencia/confianza.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
+
+
+ProgressCallback = Callable[[float, str], None]
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,8 @@ def analyze_audio_with_torchcrepe(
     target_sample_rate: int = 16000,
     hop_s: float = 0.05,
     batch_size: Optional[int] = None,
+    chunk_duration_s: Optional[float] = 20.0,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> tuple[list[OfflinePitchFrame], OfflineTorchcrepeInfo]:
     """Analiza audio mono completo con torchcrepe.
 
@@ -75,18 +80,124 @@ def analyze_audio_with_torchcrepe(
         target_sample_rate: sample rate interno de CREPE.
         hop_s: salto temporal entre estimaciones.
         batch_size: batch size Torchcrepe. Si es None se elige por modelo.
+        chunk_duration_s: duración de bloque para reportar progreso en audios largos.
+        progress_callback: callback opcional con fracción 0..1 y mensaje.
     """
     if model not in {"tiny", "full"}:
         model = "full"
 
     import torch  # type: ignore
-    import torchcrepe  # type: ignore
 
     if device is None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     if batch_size is None:
         batch_size = 256 if model == "tiny" else 64
+
+    x_original = np.asarray(audio, dtype=np.float32)
+    if x_original.ndim != 1:
+        x_original = np.reshape(x_original, (-1,)).astype(np.float32, copy=False)
+
+    duration_s = float(x_original.size) / float(max(1, sample_rate)) if x_original.size else 0.0
+
+    if x_original.size == 0:
+        info = OfflineTorchcrepeInfo(
+            model=model,
+            device=device,
+            input_sample_rate=int(sample_rate),
+            target_sample_rate=int(target_sample_rate),
+            hop_s=float(hop_s),
+            frame_count=0,
+            duration_s=0.0,
+        )
+        if progress_callback is not None:
+            progress_callback(1.0, "Audio vacío")
+        return [], info
+
+    if progress_callback is not None:
+        progress_callback(0.0, f"Inicializando Torchcrepe {model} en {device}")
+
+    if chunk_duration_s is None or chunk_duration_s <= 0.0 or duration_s <= max(1.0, chunk_duration_s * 1.1):
+        frames, info = _analyze_audio_with_torchcrepe_single(
+            audio=x_original,
+            sample_rate=sample_rate,
+            min_hz=min_hz,
+            max_hz=max_hz,
+            model=model,
+            device=device,
+            target_sample_rate=target_sample_rate,
+            hop_s=hop_s,
+            batch_size=batch_size,
+            time_offset_s=0.0,
+        )
+        if progress_callback is not None:
+            progress_callback(1.0, "Torchcrepe completado")
+        return frames, info
+
+    chunk_samples = max(int(round(float(chunk_duration_s) * float(sample_rate))), int(sample_rate))
+    total_chunks = int(math.ceil(float(x_original.size) / float(chunk_samples)))
+    all_frames: list[OfflinePitchFrame] = []
+    actual_hop_s = float(hop_s)
+
+    for chunk_index in range(total_chunks):
+        start = chunk_index * chunk_samples
+        end = min(x_original.size, start + chunk_samples)
+        chunk = x_original[start:end]
+        offset_s = float(start) / float(max(1, sample_rate))
+
+        if progress_callback is not None:
+            progress_callback(
+                float(chunk_index) / float(max(1, total_chunks)),
+                f"Torchcrepe {model}: bloque {chunk_index + 1}/{total_chunks}",
+            )
+
+        frames, info = _analyze_audio_with_torchcrepe_single(
+            audio=chunk,
+            sample_rate=sample_rate,
+            min_hz=min_hz,
+            max_hz=max_hz,
+            model=model,
+            device=device,
+            target_sample_rate=target_sample_rate,
+            hop_s=hop_s,
+            batch_size=batch_size,
+            time_offset_s=offset_s,
+        )
+        actual_hop_s = float(info.hop_s)
+        all_frames.extend(frames)
+
+        if progress_callback is not None:
+            progress_callback(
+                float(chunk_index + 1) / float(max(1, total_chunks)),
+                f"Torchcrepe {model}: bloque {chunk_index + 1}/{total_chunks} listo",
+            )
+
+    final_info = OfflineTorchcrepeInfo(
+        model=model,
+        device=device,
+        input_sample_rate=int(sample_rate),
+        target_sample_rate=int(target_sample_rate),
+        hop_s=actual_hop_s,
+        frame_count=len(all_frames),
+        duration_s=duration_s,
+    )
+    return all_frames, final_info
+
+
+def _analyze_audio_with_torchcrepe_single(
+    audio: np.ndarray,
+    sample_rate: int,
+    min_hz: float,
+    max_hz: float,
+    model: str,
+    device: str,
+    target_sample_rate: int,
+    hop_s: float,
+    batch_size: int,
+    time_offset_s: float = 0.0,
+) -> tuple[list[OfflinePitchFrame], OfflineTorchcrepeInfo]:
+    import torch  # type: ignore
+    import torchcrepe  # type: ignore
 
     x_original = np.asarray(audio, dtype=np.float32)
     if x_original.ndim != 1:
@@ -139,11 +250,12 @@ def analyze_audio_with_torchcrepe(
     pitch_np = pitch.detach().cpu().numpy().reshape(-1)
     periodicity_np = periodicity.detach().cpu().numpy().reshape(-1)
 
-    duration_s = float(x_original.size) / float(max(1, sample_rate))
+    local_duration_s = float(x_original.size) / float(max(1, sample_rate))
     frames: list[OfflinePitchFrame] = []
 
     for idx, freq in enumerate(pitch_np):
-        time_s = min(duration_s, float(idx * hop_length) / float(target_sample_rate))
+        local_time_s = min(local_duration_s, float(idx * hop_length) / float(target_sample_rate))
+        time_s = float(time_offset_s) + local_time_s
         conf = float(periodicity_np[idx]) if idx < periodicity_np.size else 0.0
         if not math.isfinite(float(freq)):
             freq = 0.0
@@ -151,7 +263,7 @@ def analyze_audio_with_torchcrepe(
             conf = 0.0
         if float(freq) < safe_min_hz or float(freq) > safe_max_hz:
             freq = 0.0
-        rms = _local_rms(x_original, sample_rate, time_s, window_s=0.05)
+        rms = _local_rms(x_original, sample_rate, local_time_s, window_s=0.05)
         frames.append(
             OfflinePitchFrame(
                 time_s=float(time_s),
@@ -168,7 +280,7 @@ def analyze_audio_with_torchcrepe(
         target_sample_rate=int(target_sample_rate),
         hop_s=float(hop_length) / float(target_sample_rate),
         frame_count=len(frames),
-        duration_s=duration_s,
+        duration_s=local_duration_s,
     )
     return frames, info
 
