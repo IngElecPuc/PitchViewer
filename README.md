@@ -1,11 +1,8 @@
-# PitchViewer v0.8.1
+# PitchViewer v0.8.2
 
 Monitor de afinación vocal de escritorio en Python/Tkinter.
 
-Esta versión corrige el diseño de backends offline: `Record` ya no fuerza siempre `Torchcrepe full`. Ahora hay dos preferencias separadas:
-
-- `Backend en vivo`: usado por `▶ Play`.
-- `Backend offline / record`: usado por `⏺ Record` + `⏹ Stop`.
+Esta versión corrige detalles visuales de la interfaz sin cambiar la regla de backends separada introducida en v0.8.1.
 
 ## Ejecución
 
@@ -21,24 +18,30 @@ Para activar Torchcrepe:
 pip install -r optional-requirements-torchcrepe.txt
 ```
 
-## Cambios v0.8.1
+## Cambios v0.8.2
 
-- Menú `Audio > Backend en vivo`.
-- Menú `Audio > Backend offline / record`.
-- `Torchcrepe full` sigue deshabilitado como backend vivo si no hay CUDA.
-- `Torchcrepe full` sigue disponible como backend offline aunque no haya CUDA.
-- El modo offline puede usar libremente:
-  - Autocorrelación FFT;
-  - YIN CMND;
-  - Torchcrepe tiny;
-  - Torchcrepe full.
-- La selección offline se guarda en `settings.json` como `offline_detector_backend`.
-- `⏺ Record` + `⏹ Stop` usa el backend offline seleccionado, no el backend vivo.
+- Botones de transporte rediseñados con glifos más grandes y modo texto, evitando el recuadro interno de emoji.
+- Se retira el botón visible `Pausar vista` de la barra superior para reducir ruido visual.
+- La acción sigue disponible como `Vista > Congelar/reanudar vista`.
+- El panel instructivo del canvas aparece al iniciar, dura 5 segundos y luego desaparece.
+- El panel instructivo puede activarse/desactivarse desde `Vista > Mostrar panel instructivo`.
+- La calibración ahora deja una marca gráfica temporal en el canvas:
+  - diagnóstico en curso;
+  - rango recomendado;
+  - rango aplicado;
+  - preset aplicado.
+
+## Backends
+
+- `▶ Play` usa `Audio > Backend en vivo`.
+- `⏺ Record` + `⏹ Stop` usa `Audio > Backend offline / record`.
+- `Torchcrepe full` queda deshabilitado para tiempo real si no hay CUDA.
+- `Torchcrepe full` sigue disponible offline aunque corra en CPU.
 
 ## Transporte
 
 - `▶`: inicia o reanuda captura viva con `Backend en vivo`.
-- `⏸`: pausa sin borrar historial.
+- `⏸`: pausa captura sin borrar historial.
 - `⏹`: detiene captura; si venías de `⏺`, lanza análisis offline.
 - `⏺`: graba en memoria dentro de la ventana temporal vigente.
 - `⏪` / `⏩`:
@@ -47,11 +50,6 @@ pip install -r optional-requirements-torchcrepe.txt
 - `⏮` / `⏭`:
   - offline: inicio/final de la grabación.
 
-## Regla de diseño
+## Congelar vista
 
-`Play` y `Record` no significan “usar el mismo backend en dos modos”. Son flujos distintos:
-
-- `▶ Play` usa `backend_live`.
-- `⏺ Record` + `⏹ Stop` usa `backend_offline`.
-
-Esto deja preparada la transición a karaoke: juego en tiempo real con backend vivo, producción/análisis con backend offline.
+`Vista > Congelar/reanudar vista` no pausa el audio. Solo congela la posición visual de la ventana temporal para poder inspeccionar el dibujo mientras la captura puede seguir entrando. Es distinto de `⏸`, que pausa la captura.

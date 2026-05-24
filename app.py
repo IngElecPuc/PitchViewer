@@ -80,7 +80,7 @@ class PitchViewerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
 
-        self.title("Monitor de afinación vocal - v0.8.1")
+        self.title("Monitor de afinación vocal - v0.8.2")
 
         self.settings_load_result = load_settings()
         self.settings = self.settings_load_result.settings
@@ -152,6 +152,8 @@ class PitchViewerApp(tk.Tk):
         self.dynamic_tracking_var = tk.BooleanVar(value=self.settings.dynamic_tracking)
         self.show_achieved_blocks_var = tk.BooleanVar(value=self.settings.show_achieved_blocks)
         self.theme_var = tk.StringVar(value=self.settings.theme_name)
+        self.help_overlay_var = tk.BooleanVar(value=True)
+        self.help_overlay_until_s: Optional[float] = time.perf_counter() + 5.0
 
         self.visual_paused = False
         self.paused_display_time_s: Optional[float] = None
@@ -159,6 +161,8 @@ class PitchViewerApp(tk.Tk):
         self._range_drag_start_y: Optional[int] = None
         self._range_drag_start_min_midi: Optional[int] = None
         self._range_drag_start_max_midi: Optional[int] = None
+        self.calibration_visual_info: Optional[dict[str, object]] = None
+        self.calibration_visual_until_s: float = 0.0
 
         self.note_status_var = tk.StringVar(value="Nota: —")
         self.freq_status_var = tk.StringVar(value="Frecuencia: —")
@@ -289,7 +293,12 @@ class PitchViewerApp(tk.Tk):
             command=self._toggle_dynamic_tracking,
         )
         view_menu.add_command(label="Centrar rango en nota actual", command=self._center_range_on_current_pitch)
-        view_menu.add_command(label="Pausar/reanudar visualización", command=self._toggle_visual_pause)
+        view_menu.add_command(label="Congelar/reanudar vista", command=self._toggle_visual_pause)
+        view_menu.add_checkbutton(
+            label="Mostrar panel instructivo",
+            variable=self.help_overlay_var,
+            command=self._toggle_help_overlay,
+        )
         view_menu.add_separator()
         view_menu.add_checkbutton(
             label="Mostrar bandas de tolerancia",
@@ -437,32 +446,31 @@ class PitchViewerApp(tk.Tk):
         toolbar = ttk.Frame(root)
         toolbar.pack(fill=tk.X, side=tk.TOP)
 
-        self.to_start_button = ttk.Button(toolbar, text="⏮", width=3, command=self._jump_offline_start)
-        self.to_start_button.pack(side=tk.LEFT, padx=(0, 2))
+        self.to_start_button = self._make_transport_button(toolbar, "⏮︎", self._jump_offline_start, "Ir al inicio offline")
+        self.to_start_button.pack(side=tk.LEFT, padx=(0, 4))
 
-        self.backward_button = ttk.Button(toolbar, text="⏪", width=3, command=self._transport_backward)
-        self.backward_button.pack(side=tk.LEFT, padx=(0, 4))
+        self.backward_button = self._make_transport_button(toolbar, "⏪︎", self._transport_backward, "Retroceder / aumentar ventana")
+        self.backward_button.pack(side=tk.LEFT, padx=(0, 6))
 
-        self.play_button = ttk.Button(toolbar, text="▶", width=3, command=self.start_audio)
-        self.play_button.pack(side=tk.LEFT, padx=(0, 2))
+        self.play_button = self._make_transport_button(toolbar, "▶︎", self.start_audio, "Play / iniciar o reanudar")
+        self.play_button.pack(side=tk.LEFT, padx=(0, 4))
 
-        self.pause_button = ttk.Button(toolbar, text="⏸", width=3, command=self.pause_audio)
-        self.pause_button.pack(side=tk.LEFT, padx=(0, 2))
+        self.pause_button = self._make_transport_button(toolbar, "⏸︎", self.pause_audio, "Pausar captura")
+        self.pause_button.pack(side=tk.LEFT, padx=(0, 4))
 
-        self.stop_button = ttk.Button(toolbar, text="⏹", width=3, command=self.stop_audio)
-        self.stop_button.pack(side=tk.LEFT, padx=(0, 2))
+        self.stop_button = self._make_transport_button(toolbar, "⏹︎", self.stop_audio, "Stop / detener")
+        self.stop_button.pack(side=tk.LEFT, padx=(0, 4))
 
-        self.record_button = ttk.Button(toolbar, text="⏺", width=3, command=self.start_recording)
-        self.record_button.pack(side=tk.LEFT, padx=(0, 4))
+        self.record_button = self._make_transport_button(toolbar, "⏺︎", self.start_recording, "Grabar para análisis offline")
+        self.record_button.pack(side=tk.LEFT, padx=(0, 6))
 
-        self.forward_button = ttk.Button(toolbar, text="⏩", width=3, command=self._transport_forward)
-        self.forward_button.pack(side=tk.LEFT, padx=(0, 2))
+        self.forward_button = self._make_transport_button(toolbar, "⏩︎", self._transport_forward, "Avanzar / reducir ventana")
+        self.forward_button.pack(side=tk.LEFT, padx=(0, 4))
 
-        self.to_end_button = ttk.Button(toolbar, text="⏭", width=3, command=self._jump_offline_end)
-        self.to_end_button.pack(side=tk.LEFT, padx=(0, 12))
+        self.to_end_button = self._make_transport_button(toolbar, "⏭︎", self._jump_offline_end, "Ir al final offline")
+        self.to_end_button.pack(side=tk.LEFT, padx=(0, 14))
 
-        self.pause_view_button = ttk.Button(toolbar, text="Pausar vista", command=self._toggle_visual_pause)
-        self.pause_view_button.pack(side=tk.LEFT, padx=(0, 12))
+        self.pause_view_button = None
 
         ttk.Button(toolbar, text="Fuente...", command=self._choose_input_device).pack(side=tk.LEFT, padx=(0, 12))
 
@@ -506,12 +514,48 @@ class PitchViewerApp(tk.Tk):
         footer = ttk.Label(
             root,
             text=(
-                "v0.8.1: calibración, backends en vivo/offline separados y análisis offline seleccionable. "
+                "v0.8.2: transporte visual corregido, panel instructivo temporal y calibración visible. "
                 "Usa audífonos para evitar que el micrófono capture los parlantes."
             ),
             anchor="w",
         )
         footer.pack(fill=tk.X, side=tk.BOTTOM, pady=(6, 0))
+
+    def _make_transport_button(self, parent: tk.Widget, symbol: str, command, tooltip: str = "") -> tk.Button:
+        """Crea botones de transporte con glifos en modo texto, sin recuadro interno tipo emoji."""
+        button = tk.Button(
+            parent,
+            text=symbol,
+            command=command,
+            font=("Segoe UI Symbol", 15, "bold"),
+            width=3,
+            height=1,
+            padx=4,
+            pady=2,
+            bd=0,
+            relief=tk.FLAT,
+            overrelief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground="#b8c2cc",
+            highlightcolor="#8aa0b4",
+            background="#f5f7fa",
+            foreground="#0f1720",
+            activebackground="#e5eaf0",
+            activeforeground="#0f1720",
+            cursor="hand2",
+            takefocus=True,
+        )
+        if tooltip:
+            button.bind("<Enter>", lambda _event, text=tooltip: self.audio_status_var.set(text))
+        return button
+
+    def _set_visual_pause_label(self, text: str) -> None:
+        button = getattr(self, "pause_view_button", None)
+        if button is not None:
+            try:
+                button.configure(text=text)
+            except Exception:
+                pass
 
     def _refresh_config_status_after_load(self) -> None:
         if self.settings_load_result.error:
@@ -900,7 +944,7 @@ class PitchViewerApp(tk.Tk):
 
         self.visual_paused = False
         self.paused_display_time_s = None
-        self.pause_view_button.configure(text="Pausar vista")
+        self._set_visual_pause_label("Pausar vista")
         self.is_audio_paused = False
         self.paused_audio_elapsed_s = 0.0
         self.capture_mode = mode
@@ -1554,12 +1598,28 @@ class PitchViewerApp(tk.Tk):
         return min(candidates, key=lambda value: abs(value - previous_midi))
 
     def _ui_loop(self) -> None:
+        self._update_transient_overlays()
         self._consume_offline_analysis_results()
         self._consume_calibration_results()
         self._consume_pitch_points()
         self._update_status()
         self._redraw_canvas()
         self.after(33, self._ui_loop)
+
+    def _update_transient_overlays(self) -> None:
+        now = time.perf_counter()
+        if self.help_overlay_until_s is not None and now >= self.help_overlay_until_s:
+            self.help_overlay_var.set(False)
+            self.help_overlay_until_s = None
+
+        if self.calibration_visual_info is not None and self.calibration_visual_until_s > 0:
+            if now >= self.calibration_visual_until_s:
+                self.calibration_visual_info = None
+                self.calibration_visual_until_s = 0.0
+
+    def _toggle_help_overlay(self) -> None:
+        # Cuando el usuario lo invoca desde el menú, queda fijo hasta que lo desactive.
+        self.help_overlay_until_s = None
 
     def _consume_pitch_points(self) -> None:
         while True:
@@ -1926,12 +1986,12 @@ class PitchViewerApp(tk.Tk):
         if self.visual_paused:
             self.visual_paused = False
             self.paused_display_time_s = None
-            self.pause_view_button.configure(text="Pausar vista")
+            self._set_visual_pause_label("Pausar vista")
             return
 
         self.visual_paused = True
         self.paused_display_time_s = self._current_time_s()
-        self.pause_view_button.configure(text="Reanudar vista")
+        self._set_visual_pause_label("Reanudar vista")
 
     def _center_range_on_current_pitch(self) -> None:
         point = self.current_point
@@ -2308,6 +2368,18 @@ class PitchViewerApp(tk.Tk):
         )
 
         canvas.create_line(plot_right, plot_top, plot_right, plot_bottom, fill=palette["text"], width=1)
+        self._draw_calibration_overlay(
+            canvas=canvas,
+            settings=settings,
+            palette=palette,
+            plot_left=plot_left,
+            plot_right=plot_right,
+            plot_top=plot_top,
+            plot_bottom=plot_bottom,
+            visible_min_midi=visible_min_midi,
+            visible_max_midi=visible_max_midi,
+            midi_to_y=midi_to_y,
+        )
         self._draw_legend(canvas, settings, palette, plot_left, plot_top)
 
     def _draw_pitch_grid(
@@ -2637,6 +2709,87 @@ class PitchViewerApp(tk.Tk):
                         anchor="center",
                     )
 
+    def _draw_calibration_overlay(
+        self,
+        canvas: tk.Canvas,
+        settings: AppSettings,
+        palette: dict[str, str],
+        plot_left: int,
+        plot_right: int,
+        plot_top: int,
+        plot_bottom: int,
+        visible_min_midi: int,
+        visible_max_midi: int,
+        midi_to_y: Callable[[float], float],
+    ) -> None:
+        info = self.calibration_visual_info
+        if not info:
+            return
+
+        min_midi = info.get("min_midi")
+        max_midi = info.get("max_midi")
+        message = str(info.get("message", "Calibración"))
+        detail = str(info.get("detail", ""))
+        applied = bool(info.get("applied", False))
+
+        accent = "#22c55e" if applied else "#f59e0b"
+
+        if isinstance(min_midi, int) and isinstance(max_midi, int):
+            if max_midi >= visible_min_midi and min_midi <= visible_max_midi:
+                y_top = max(plot_top, min(plot_bottom, midi_to_y(max_midi)))
+                y_bottom = max(plot_top, min(plot_bottom, midi_to_y(min_midi)))
+                if y_bottom < y_top:
+                    y_top, y_bottom = y_bottom, y_top
+                canvas.create_rectangle(
+                    plot_left,
+                    y_top,
+                    plot_right,
+                    y_bottom,
+                    outline=accent,
+                    width=2,
+                    dash=(6, 4),
+                )
+                canvas.create_line(plot_right - 12, y_top, plot_right - 12, y_bottom, fill=accent, width=3)
+                canvas.create_line(plot_right - 24, y_top, plot_right, y_top, fill=accent, width=2)
+                canvas.create_line(plot_right - 24, y_bottom, plot_right, y_bottom, fill=accent, width=2)
+
+        x2 = plot_right - 12
+        x1 = max(plot_left + 16, x2 - 330)
+        y1 = plot_top + 10
+        y2 = y1 + (54 if detail else 36)
+        canvas.create_rectangle(x1, y1, x2, y2, fill=palette["legend_bg"], outline=accent, width=2)
+        canvas.create_text(x1 + 10, y1 + 14, text=message, fill=palette["text"], font=("TkDefaultFont", 9, "bold"), anchor="w")
+        if detail:
+            canvas.create_text(x1 + 10, y1 + 34, text=detail, fill=palette["text"], font=("TkDefaultFont", 8), anchor="w")
+
+    def _set_calibration_visual_result(self, result: dict[str, object], applied: bool) -> None:
+        with self.settings_lock:
+            language = self.settings.note_language
+
+        min_midi = int(result["recommended_min_midi"])
+        max_midi = int(result["recommended_max_midi"])
+        min_note = midi_to_note_name(min_midi, language)
+        max_note = midi_to_note_name(max_midi, language)
+        conf = float(result["recommended_confidence"])
+        rms = float(result["recommended_rms"])
+        status = "Calibración aplicada" if applied else "Calibración recomendada"
+        self.calibration_visual_info = {
+            "message": status,
+            "detail": f"Rango {min_note}-{max_note} | conf {conf:.2f} | RMS {rms:.4f}",
+            "min_midi": min_midi,
+            "max_midi": max_midi,
+            "applied": applied,
+        }
+        self.calibration_visual_until_s = time.perf_counter() + 12.0
+
+    def _set_calibration_visual_message(self, message: str, detail: str = "", seconds: float = 8.0) -> None:
+        self.calibration_visual_info = {
+            "message": message,
+            "detail": detail,
+            "applied": False,
+        }
+        self.calibration_visual_until_s = time.perf_counter() + max(1.0, float(seconds))
+
     def _draw_legend(
         self,
         canvas: tk.Canvas,
@@ -2645,6 +2798,9 @@ class PitchViewerApp(tk.Tk):
         plot_left: int,
         plot_top: int,
     ) -> None:
+        if not bool(self.help_overlay_var.get()):
+            return
+
         lines = [
             f"Línea pitch: grosor {settings.pitch_line_width}",
             f"Banda válida: ±{settings.tolerance_cents} cents",
@@ -2793,6 +2949,15 @@ class PitchViewerApp(tk.Tk):
         self._rebuild_menu()
         self._autosave_settings()
 
+        self.calibration_visual_info = {
+            "message": f"Preset aplicado: {label}",
+            "detail": f"conf {self.settings.confidence_threshold:.2f} | RMS {self.settings.rms_threshold:.4f}",
+            "min_midi": int(self.settings.min_midi),
+            "max_midi": int(self.settings.max_midi),
+            "applied": True,
+        }
+        self.calibration_visual_until_s = time.perf_counter() + 10.0
+
         if was_running:
             self.start_audio()
 
@@ -2863,6 +3028,11 @@ class PitchViewerApp(tk.Tk):
 
         self.calibration_running = True
         self.audio_status_var.set(f"Calibración: grabando {duration_s:.1f}s")
+        self._set_calibration_visual_message(
+            "Calibración: grabando voz",
+            f"Duración {duration_s:.1f}s | canta una nota y cambia de nota",
+            seconds=float(duration_s) + 3.0,
+        )
 
         thread = threading.Thread(
             target=self._voice_calibration_worker,
@@ -3047,6 +3217,7 @@ class PitchViewerApp(tk.Tk):
         )
 
         self.audio_status_var.set("Calibración: resultado listo")
+        self._set_calibration_visual_result(result, applied=False)
         apply = messagebox.askyesno("Diagnóstico de micrófono y voz", summary, parent=self)
         if not apply:
             return
@@ -3059,6 +3230,7 @@ class PitchViewerApp(tk.Tk):
             self.settings = normalize_settings(self.settings)
 
         self.dynamic_center_midi = None
+        self._set_calibration_visual_result(result, applied=True)
         self._refresh_status_labels()
         self._autosave_settings()
         self.audio_status_var.set("Calibración: recomendaciones aplicadas")
@@ -3066,7 +3238,7 @@ class PitchViewerApp(tk.Tk):
     def _show_about(self) -> None:
         messagebox.showinfo(
             "Acerca de",
-            "Monitor de afinación vocal - v0.8.0\n\n"
+            "Monitor de afinación vocal - v0.8.2\n\n"
             "Incluye calibración de micrófono/voz, presets de estabilidad y backends separados para vivo/offline.\n"
             "Si no hay CUDA, Torchcrepe full queda deshabilitado en vivo, pero sigue disponible como backend offline/record seleccionable.\n"
             "La configuración guarda también el backend seleccionado.\n\n"
