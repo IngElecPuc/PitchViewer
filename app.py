@@ -105,7 +105,7 @@ class PitchViewerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
 
-        self.title("Monitor de afinación vocal - v0.9.4")
+        self.title("Monitor de afinación vocal - v0.9.5")
 
         self.settings_load_result = load_settings()
         self.settings = self.settings_load_result.settings
@@ -595,7 +595,7 @@ class PitchViewerApp(tk.Tk):
         self.footer = ttk.Label(
             root,
             text=(
-                "v0.9.4: separación IA offline con Demucs o Audio Separator / UVR; "
+                "v0.9.5: separación IA offline con stems y ganancias por pista; "
                 "exportación WAV/MP3 con ganancias por pista."
             ),
             anchor="w",
@@ -3255,7 +3255,14 @@ class PitchViewerApp(tk.Tk):
             ttk.Label(row, text=f"{label}:", width=18, anchor="w").pack(side=tk.LEFT)
             var = tk.DoubleVar(value=100.0)
             self.separation_stem_gain_vars[stem_name] = var
-            ttk.Scale(row, from_=0.0, to=150.0, orient=tk.HORIZONTAL, variable=var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+            ttk.Scale(
+                row,
+                from_=0.0,
+                to=150.0,
+                orient=tk.HORIZONTAL,
+                variable=var,
+                length=360,
+            ).pack(side=tk.LEFT, padx=(0, 8))
             value_label = ttk.Label(row, text="100%", width=7, anchor="e")
             value_label.pack(side=tk.LEFT)
 
@@ -4280,7 +4287,7 @@ class PitchViewerApp(tk.Tk):
     def _show_about(self) -> None:
         messagebox.showinfo(
             "Acerca de",
-            "Monitor de afinación vocal - v0.9.4\n\n"
+            "Monitor de afinación vocal - v0.9.5\n\n"
             "Incluye karaoke producción, separación IA offline, motores Demucs y Audio Separator / UVR, y exportación WAV/MP3.\n"
             "Si no hay CUDA, los procesos offline pueden correr en CPU; CUDA solo acelera.\n"
             "Para MP3/M4A/MP4 y exportar MP3 se requiere ffmpeg en PATH.\n\n"

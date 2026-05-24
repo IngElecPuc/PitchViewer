@@ -26,6 +26,8 @@ class RuntimeInfo:
 	ffmpeg_available: bool
 	ffmpeg_path: str
 	ffmpeg_source: str
+	torchcodec_available: bool
+	torchcodec_version: str
 
 
 _RUNTIME_INFO: Optional[RuntimeInfo] = None
@@ -64,6 +66,16 @@ def detect_runtime_info() -> RuntimeInfo:
 	cuda_device_name = ""
 	cuda_device_count = 0
 	ffmpeg_available, ffmpeg_path, ffmpeg_source = find_ffmpeg_executable()
+	torchcodec_available = False
+	torchcodec_version = "no instalado"
+
+	try:
+		import importlib.metadata as metadata
+		metadata.version("torchcodec")
+		torchcodec_available = True
+		torchcodec_version = metadata.version("torchcodec")
+	except Exception:
+		pass
 
 	try:
 		import torch  # type: ignore
@@ -90,6 +102,8 @@ def detect_runtime_info() -> RuntimeInfo:
 		ffmpeg_available=ffmpeg_available,
 		ffmpeg_path=ffmpeg_path,
 		ffmpeg_source=ffmpeg_source,
+		torchcodec_available=torchcodec_available,
+		torchcodec_version=torchcodec_version,
 	)
 
 

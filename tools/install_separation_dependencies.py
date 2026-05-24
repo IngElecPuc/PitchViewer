@@ -114,7 +114,7 @@ def print_summary(results: list[StepResult]) -> int:
         print(f"[{status}] {result.name}: {result.detail}")
 
     if exit_code == 0:
-        print("\nRuta estable lista: Demucs + exportación MP3 vía imageio-ffmpeg.")
+        print("\nRuta estable lista: Demucs + soundfile + exportación MP3 vía imageio-ffmpeg.")
         print("Audio Separator / UVR puede quedar no disponible sin bloquear la app.")
     return exit_code
 

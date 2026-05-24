@@ -9,6 +9,8 @@
 # Notas:
 # - imageio-ffmpeg entrega un binario ffmpeg usable desde Python, útil para MP3.
 # - Demucs es el motor estable recomendado.
+# - PitchViewer ejecuta Demucs mediante un runner propio que lee WAV con soundfile
+#   para evitar fallas de torchaudio/TorchCodec en Windows + Python reciente.
 # - Audio Separator / UVR se intenta desde el instalador Python y no desde este
 #   archivo, porque en Windows + Python 3.14 puede fallar por dependencias
 #   nativas como diffq-fixed. Si falla, el instalador continúa y Demucs queda usable.

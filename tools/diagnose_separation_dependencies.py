@@ -58,6 +58,16 @@ def main() -> None:
 		print("[NO] ffmpeg | instala imageio-ffmpeg o ffmpeg global para MP3/M4A/MP4")
 		print(f"    detalle: {ff_version}")
 
+	if has_module("soundfile"):
+		print("[OK] soundfile | usado por el runner de Demucs para evitar torchaudio/TorchCodec")
+	else:
+		print("[NO] soundfile | ejecuta: python tools/install_separation_dependencies.py")
+
+	if has_module("torchcodec"):
+		print("[INFO] torchcodec | instalado, pero PitchViewer no depende de él para Demucs")
+	else:
+		print("[INFO] torchcodec | no instalado; correcto, no es requerido por el runner propio")
+
 	if has_module("demucs"):
 		print("[OK] demucs | motor recomendado")
 		try:
@@ -103,8 +113,8 @@ def main() -> None:
 		print("    Para intentarlo: python tools/install_separation_dependencies.py --force-uvr")
 
 	print()
-	if has_module("demucs") and ff_ok:
-		print("Resultado: Demucs + exportación MP3 deberían estar disponibles.")
+	if has_module("demucs") and has_module("soundfile") and ff_ok:
+		print("Resultado: Demucs + runner soundfile + exportación MP3 deberían estar disponibles.")
 	elif has_module("demucs"):
 		print("Resultado: Demucs está instalado, pero falta ffmpeg para MP3/M4A/MP4 robusto.")
 	else:

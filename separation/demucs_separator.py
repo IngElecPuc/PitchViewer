@@ -80,6 +80,7 @@ def is_demucs_available() -> bool:
 	return importlib.util.find_spec("demucs") is not None
 
 
+
 def is_audio_separator_available() -> bool:
 	return importlib.util.find_spec("audio_separator") is not None or shutil.which("audio-separator") is not None
 
@@ -92,6 +93,23 @@ def is_ffmpeg_available() -> bool:
 def ffmpeg_path() -> str:
 	_available, path, _source = find_ffmpeg_executable()
 	return path
+
+
+def _project_root() -> Path:
+	return Path(__file__).resolve().parents[1]
+
+
+def _demucs_soundfile_runner_path() -> Path:
+	"""Runner de Demucs que evita torchaudio.load/TorchCodec.
+
+	En Windows + Python reciente, torchaudio puede forzar TorchCodec y fallar
+	por DLLs. Este runner parchea demucs.separate.load_track para leer WAV
+	con soundfile y luego deja que Demucs procese normalmente.
+	"""
+	runner = _project_root() / "tools" / "run_demucs_soundfile.py"
+	if not runner.exists():
+		raise RuntimeError(f"No se encontró el runner de Demucs: {runner}")
+	return runner
 
 
 def default_separation_dir() -> Path:
@@ -164,12 +182,12 @@ def run_demucs_separation(
 	if not is_demucs_available():
 		raise RuntimeError(
 			"Demucs no está instalado. Instala las dependencias opcionales con: "
-			"pip install -r optional-requirements-separation.txt"
+			"python tools/install_separation_dependencies.py"
 		)
 
-	source = Path(input_path).expanduser().resolve()
-	if not source.exists():
-		raise FileNotFoundError(str(source))
+	original_source = Path(input_path).expanduser().resolve()
+	if not original_source.exists():
+		raise FileNotFoundError(str(original_source))
 
 	out_root = Path(output_root).expanduser().resolve()
 	out_root.mkdir(parents=True, exist_ok=True)
@@ -178,54 +196,68 @@ def run_demucs_separation(
 	mode = str(mode or "4stems").lower()
 	model_name = str(model_name or "htdemucs")
 
-	cmd = [
-		sys.executable,
-		"-m",
-		"demucs",
-		"-n",
-		model_name,
-		"--device",
-		device,
-		"-o",
-		str(out_root),
-	]
-	if mode in {"2stems", "vocals", "voice"}:
-		cmd.extend(["--two-stems", "vocals"])
-	cmd.append(str(source))
+	with tempfile.TemporaryDirectory(prefix="pitchviewer_demucs_input_") as tmpdir:
+		prepared_source = _prepare_input_for_demucs(original_source, Path(tmpdir), progress_callback)
 
-	if progress_callback is not None:
-		progress_callback(0.02, f"Demucs: iniciando separación offline en {device}")
+		runner = _demucs_soundfile_runner_path()
+		cmd = [
+			sys.executable,
+			str(runner),
+			"-n",
+			model_name,
+			"--device",
+			device,
+			"-o",
+			str(out_root),
+		]
+		if mode in {"2stems", "vocals", "voice"}:
+			cmd.extend(["--two-stems", "vocals"])
+		cmd.append(str(prepared_source))
 
-	proc = subprocess.Popen(
-		cmd,
-		stdout=subprocess.PIPE,
-		stderr=subprocess.STDOUT,
-		text=True,
-		encoding="utf-8",
-		errors="replace",
-		bufsize=1,
-	)
+		if progress_callback is not None:
+			progress_callback(0.02, f"Demucs: iniciando separación offline en {device}")
 
-	last_message = "Demucs: procesando"
-	if proc.stdout is not None:
-		for line in proc.stdout:
-			message = line.strip()
-			if not message:
-				continue
-			last_message = message
-			fraction = _parse_percent_progress(message, default=0.15)
-			if progress_callback is not None:
-				progress_callback(fraction, f"Demucs: {message[:120]}")
+		proc = subprocess.Popen(
+			cmd,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.STDOUT,
+			text=True,
+			encoding="utf-8",
+			errors="replace",
+			bufsize=1,
+			env=_build_subprocess_env(),
+		)
 
-	return_code = proc.wait()
-	if return_code != 0:
-		raise RuntimeError(f"Demucs terminó con código {return_code}. Último mensaje: {last_message}")
+		last_message = "Demucs: procesando"
+		log_tail: list[str] = []
+		if proc.stdout is not None:
+			for line in proc.stdout:
+				message = line.strip()
+				if not message:
+					continue
+				last_message = message
+				log_tail.append(message)
+				if len(log_tail) > 80:
+					log_tail = log_tail[-80:]
+				fraction = _parse_percent_progress(message, default=0.15)
+				if progress_callback is not None:
+					progress_callback(fraction, f"Demucs: {message[:120]}")
 
-	if progress_callback is not None:
-		progress_callback(0.96, "Demucs: cargando stems")
+		return_code = proc.wait()
+		if return_code != 0:
+			detail = "\n".join(log_tail[-30:]) if log_tail else last_message
+			raise RuntimeError(
+				f"Demucs terminó con código {return_code}.\n\n"
+				f"Comando:\n{' '.join(cmd)}\n\n"
+				f"Últimas líneas:\n{detail}"
+			)
 
-	return load_demucs_result(source, out_root, model_name, device)
+		if progress_callback is not None:
+			progress_callback(0.96, "Demucs: cargando stems")
 
+		result = load_demucs_result(prepared_source, out_root, model_name, device)
+		result.source_path = original_source
+		return result
 
 def run_audio_separator_separation(
 	input_path: str,
@@ -310,6 +342,92 @@ def run_audio_separator_separation(
 	)
 
 
+def _build_subprocess_env() -> dict[str, str]:
+	env = dict(os.environ)
+	available, ffmpeg, _source = find_ffmpeg_executable()
+	if available and ffmpeg:
+		ffmpeg_dir = str(Path(ffmpeg).resolve().parent)
+		current_path = env.get("PATH", "")
+		if ffmpeg_dir not in current_path.split(os.pathsep):
+			env["PATH"] = ffmpeg_dir + os.pathsep + current_path
+		env.setdefault("FFMPEG_BINARY", str(ffmpeg))
+	return env
+
+
+def _prepare_input_for_demucs(
+	source: Path,
+	tmpdir: Path,
+	progress_callback: ProgressCallback = None,
+) -> Path:
+	"""Devuelve un WAV apto para Demucs.
+
+	Demucs se ejecuta mediante un runner propio que lee WAV con soundfile.
+	Por eso los formatos comprimidos se convierten primero a WAV PCM limpio usando
+	el ffmpeg que PitchViewer detectó vía runtime.py o imageio-ffmpeg.
+	"""
+
+	if source.suffix.lower() == ".wav":
+		return source
+	return _transcode_to_wav_for_demucs(source, tmpdir, progress_callback)
+
+
+def _transcode_to_wav_for_demucs(
+	source: Path,
+	tmpdir: Path,
+	progress_callback: ProgressCallback = None,
+) -> Path:
+	available, ffmpeg, ffmpeg_source = find_ffmpeg_executable()
+	if not available or not ffmpeg:
+		raise RuntimeError(
+			"No hay ffmpeg disponible para convertir el archivo a WAV antes de Demucs.\n"
+			"Ejecuta: python tools/install_separation_dependencies.py\n"
+			"o instala ffmpeg globalmente y agrégalo al PATH."
+		)
+
+	if progress_callback is not None:
+		progress_callback(0.03, f"FFmpeg: convirtiendo {source.suffix.lower()} a WAV temporal ({ffmpeg_source})")
+
+	# Mantener el stem original hace que la carpeta de salida de Demucs conserve
+	# un nombre reconocible, por ejemplo Amigo.wav -> htdemucs/Amigo/.
+	out = tmpdir / f"{source.stem}.wav"
+	cmd = [
+		ffmpeg,
+		"-hide_banner",
+		"-y",
+		"-loglevel",
+		"error",
+		"-i",
+		str(source),
+		"-vn",
+		"-ac",
+		"2",
+		"-ar",
+		"44100",
+		"-c:a",
+		"pcm_s16le",
+		str(out),
+	]
+	proc = subprocess.run(
+		cmd,
+		stdout=subprocess.PIPE,
+		stderr=subprocess.STDOUT,
+		text=True,
+		encoding="utf-8",
+		errors="replace",
+		check=False,
+		env=_build_subprocess_env(),
+	)
+	if proc.returncode != 0:
+		raise RuntimeError(
+			"FFmpeg no pudo convertir el audio de entrada a WAV temporal.\n\n"
+			f"Comando:\n{' '.join(cmd)}\n\n"
+			f"Salida:\n{proc.stdout}"
+		)
+	if not out.exists() or out.stat().st_size <= 44:
+		raise RuntimeError(f"FFmpeg no generó un WAV válido: {out}")
+	return out
+
+
 def _parse_percent_progress(message: str, default: float) -> float:
 	match = re.search(r"(\d{1,3})%", message)
 	if match:
@@ -348,15 +466,20 @@ def load_generic_stem_result(source: Path, output_dir: Path, model_name: str, de
 
 def normalize_stem_name(path: Path) -> str:
 	name = path.stem.lower()
-	clean = re.sub(r"[^a-z0-9]+", "_", name)
-	if "vocals" in clean or "vocal" in clean or "voice" in clean or "voz" in clean:
-		return "vocals"
+	clean = re.sub(r"[^a-z0-9]+", "_", name).strip("_")
+
+	# Importante: evaluar primero los nombres negativos/compuestos.
+	# "no_vocals.wav" contiene la subcadena "vocals"; si se revisa vocals
+	# antes, el stem instrumental queda mal clasificado como voz y la UI muestra
+	# una sola barra de ganancia en modo 2stems.
+	if "no_vocals" in clean or "novocals" in clean or "no_vocal" in clean or "no_voice" in clean:
+		return "no_vocals"
 	if "instrumental" in clean:
 		return "instrumental"
-	if "no_vocals" in clean or "novocals" in clean or "no_vocal" in clean:
-		return "no_vocals"
 	if "accompaniment" in clean or "acomp" in clean:
 		return "accompaniment"
+	if "vocals" in clean or "vocal" in clean or "voice" in clean or "voz" in clean:
+		return "vocals"
 	if "drums" in clean or "drum" in clean:
 		return "drums"
 	if "bass" in clean or "bajo" in clean:
