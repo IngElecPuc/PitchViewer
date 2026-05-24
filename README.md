@@ -1,58 +1,48 @@
-# Pitch Viewer - Etapa 7
+# Pitch Viewer v0.7.1
 
-Aplicación Tkinter para seguimiento visual de pitch vocal en tiempo real.
+Aplicación de escritorio en Tkinter para monitoreo de afinación vocal.
 
-## Ejecutar
-
-Desde la carpeta `PitchViewer`:
+## Ejecución
 
 ```bash
+cd "E:\\Felpipe\\Proyectos propios\\PitchViewer"
 pip install -r requirements.txt
 python .\main.py
 ```
 
-También funciona como módulo si se ejecuta desde la carpeta padre:
+## Dependencias base
 
-```bash
-python -m PitchViewer.main
+```txt
+numpy
+sounddevice
 ```
 
-## Cambios de la etapa 7
+## Dependencias opcionales para Torchcrepe
 
-- Rangos vocales extendidos en `Vista > Rango visible`:
-  - Bajo ±½ octava.
-  - Barítono ±½ octava.
-  - Tenor ±½ octava.
-  - Contralto ±½ octava.
-  - Mezzo ±½ octava.
-  - Soprano ±½ octava.
-- Seguimiento dinámico de voz:
-  - `Vista > Seguimiento dinámico de voz`.
-  - Desplaza visualmente la ventana de notas para mantener la voz cerca del centro.
-- Bloques de nota alcanzada:
-  - `Vista > Mostrar bloques alcanzados`.
-  - Los bloques aparecen solo cuando el pitch está dentro de la tolerancia en cents y dentro de la escala activa.
-  - Esto deja preparadas las capas gráficas para karaoke: target vs. nota efectivamente alcanzada.
-- Línea de pitch con color único.
-- Grosor de línea ajustable:
-  - `Vista > Grosor de línea de pitch...`.
-- Zonas inválidas más explícitas:
-  - La región válida de una nota es la banda de tolerancia.
-  - Fuera de esa banda, la voz aparece como desafinada aunque esté cerca de una nota.
-  - La tolerancia máxima se limita a 49 cents para evitar que las bandas de notas contiguas se toquen.
-- Pausa visual sin detener audio:
-  - Botón `Pausar vista` o `Vista > Pausar/reanudar visualización`.
-- Zoom vertical con rueda del mouse.
-- Arrastre vertical del rango con botón medio o botón derecho.
-- Leyenda visual sobre el canvas.
-- Modo claro/oscuro básico.
+```bash
+pip install -r optional-requirements-torchcrepe.txt
+```
 
-## Backends
+## Cambios de v0.7.1
 
-La etapa 7 conserva los backends de la etapa 6:
+- Se mantiene la etapa 7 visual: rangos vocales, seguimiento dinámico, bloques de nota alcanzada, grosor configurable de línea, zonas válidas por tolerancia y modo claro/oscuro.
+- Se agrega transporte visual con botones:
+  - `▶` inicia o reanuda captura en vivo.
+  - `⏸` pausa la captura sin borrar el historial visual.
+  - `⏹` detiene la captura.
+  - `⏺` graba en memoria para análisis offline.
+  - `⏪` / `⏩` navegan media ventana en una grabación offline; en modo online ajustan la ventana temporal +1s / -1s.
+  - `⏮` / `⏭` saltan al inicio/final de una grabación offline.
+- La grabación offline se limita a la ventana temporal configurada, con máximo configurable hasta 60s mediante los botones `⏪`/`⏩`.
+- Al detener una grabación iniciada con `⏺`, se analiza el audio en memoria con Torchcrepe full.
+- Si no se detecta CUDA, Torchcrepe full queda deshabilitado como backend en vivo, pero sigue disponible para análisis offline.
 
-- Autocorrelación FFT.
-- YIN CMND.
-- Torchcrepe tiny/full como opción experimental, si se instalan dependencias opcionales.
+## Notas sobre Torchcrepe full
 
-Torchcrepe sigue siendo opcional y puede fallar según versión de Python, PyTorch y Windows. Se deja para una instancia separada de reparación.
+Torchcrepe full puede funcionar correctamente en CPU para análisis offline, pero no suele alcanzar tiempo real. En equipos sin CUDA se recomienda usar en vivo:
+
+- YIN CMND
+- Autocorrelación FFT
+- Torchcrepe tiny, si responde suficientemente rápido
+
+Torchcrepe full queda reservado para análisis offline y, más adelante, para producción de archivos karaoke.

@@ -45,6 +45,8 @@ from .constants import (
 from .detection.registry import (
     BACKENDS,
     BACKEND_AUTOCORRELATION,
+    BACKEND_TORCHCREPE_FULL,
+    BACKEND_TORCHCREPE_TINY,
     backend_label,
     create_pitch_detector,
     normalize_backend_id,
@@ -77,7 +79,7 @@ class PitchViewerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
 
-        self.title("Monitor de afinación vocal - Etapa 7")
+        self.title("Monitor de afinación vocal - v0.7.1")
 
         self.settings_load_result = load_settings()
         self.settings = self.settings_load_result.settings
@@ -101,6 +103,28 @@ class PitchViewerApp(tk.Tk):
         self.frame_size = 4096
         self.pitch_detector = None
         self.active_backend_id = normalize_backend_id(self.settings.detector_backend)
+        self.cuda_available = self._detect_cuda_available()
+        self.torchcrepe_full_realtime_enabled = self.cuda_available
+        if (
+            not self.torchcrepe_full_realtime_enabled
+            and self.active_backend_id == BACKEND_TORCHCREPE_FULL
+        ):
+            self.active_backend_id = BACKEND_TORCHCREPE_TINY
+            self.settings.detector_backend = BACKEND_TORCHCREPE_TINY
+
+        self.is_audio_paused = False
+        self.paused_audio_elapsed_s = 0.0
+        self.capture_mode = "idle"
+
+        self.is_recording = False
+        self.recording_lock = threading.Lock()
+        self.recorded_chunks: deque[np.ndarray] = deque()
+        self.recorded_sample_count = 0
+        self.offline_analysis_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.offline_analysis_running = False
+        self.offline_mode = False
+        self.offline_duration_s = 0.0
+        self.offline_cursor_s = 0.0
 
         self.time_origin = time.perf_counter()
         self.points: deque[PitchPoint] = deque(maxlen=20000)
@@ -154,6 +178,21 @@ class PitchViewerApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(33, self._ui_loop)
 
+    @staticmethod
+    def _detect_cuda_available() -> bool:
+        try:
+            import torch  # type: ignore
+
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
+
+    def _is_realtime_backend_enabled(self, backend_id: str) -> bool:
+        backend_id = normalize_backend_id(backend_id)
+        if backend_id == BACKEND_TORCHCREPE_FULL and not self.torchcrepe_full_realtime_enabled:
+            return False
+        return True
+
     def _build_menu(self) -> None:
         menubar = tk.Menu(self)
 
@@ -170,8 +209,10 @@ class PitchViewerApp(tk.Tk):
         menubar.add_cascade(label="Archivo", menu=file_menu)
 
         audio_menu = tk.Menu(menubar, tearoff=False)
-        audio_menu.add_command(label="Iniciar captura", command=self.start_audio)
-        audio_menu.add_command(label="Detener captura", command=self.stop_audio)
+        audio_menu.add_command(label="▶ Play / iniciar captura", command=self.start_audio)
+        audio_menu.add_command(label="⏸ Pausar captura", command=self.pause_audio)
+        audio_menu.add_command(label="⏹ Stop / detener captura", command=self.stop_audio)
+        audio_menu.add_command(label="⏺ Grabar para análisis offline", command=self.start_recording)
         audio_menu.add_separator()
         audio_menu.add_command(label="Fuente de entrada...", command=self._choose_input_device)
         audio_menu.add_command(label="Actualizar dispositivos", command=lambda: self._load_audio_devices(select_default=False))
@@ -180,10 +221,15 @@ class PitchViewerApp(tk.Tk):
         backend_menu = tk.Menu(audio_menu, tearoff=False)
         for backend in BACKENDS:
             suffix = " (opcional)" if backend.is_optional else ""
+            state = tk.NORMAL
+            if backend.backend_id == BACKEND_TORCHCREPE_FULL and not self.torchcrepe_full_realtime_enabled:
+                suffix = " (offline; requiere CUDA para vivo)"
+                state = tk.DISABLED
             backend_menu.add_radiobutton(
                 label=f"{backend.label}{suffix}",
                 variable=self.detector_backend_var,
                 value=backend.backend_id,
+                state=state,
                 command=lambda value=backend.backend_id: self._set_detector_backend(value),
             )
         audio_menu.add_cascade(label="Backend de detección", menu=backend_menu)
@@ -346,11 +392,29 @@ class PitchViewerApp(tk.Tk):
         toolbar = ttk.Frame(root)
         toolbar.pack(fill=tk.X, side=tk.TOP)
 
-        self.start_button = ttk.Button(toolbar, text="Iniciar", command=self.start_audio)
-        self.start_button.pack(side=tk.LEFT, padx=(0, 4))
+        self.to_start_button = ttk.Button(toolbar, text="⏮", width=3, command=self._jump_offline_start)
+        self.to_start_button.pack(side=tk.LEFT, padx=(0, 2))
 
-        self.stop_button = ttk.Button(toolbar, text="Detener", command=self.stop_audio)
-        self.stop_button.pack(side=tk.LEFT, padx=(0, 4))
+        self.backward_button = ttk.Button(toolbar, text="⏪", width=3, command=self._transport_backward)
+        self.backward_button.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.play_button = ttk.Button(toolbar, text="▶", width=3, command=self.start_audio)
+        self.play_button.pack(side=tk.LEFT, padx=(0, 2))
+
+        self.pause_button = ttk.Button(toolbar, text="⏸", width=3, command=self.pause_audio)
+        self.pause_button.pack(side=tk.LEFT, padx=(0, 2))
+
+        self.stop_button = ttk.Button(toolbar, text="⏹", width=3, command=self.stop_audio)
+        self.stop_button.pack(side=tk.LEFT, padx=(0, 2))
+
+        self.record_button = ttk.Button(toolbar, text="⏺", width=3, command=self.start_recording)
+        self.record_button.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.forward_button = ttk.Button(toolbar, text="⏩", width=3, command=self._transport_forward)
+        self.forward_button.pack(side=tk.LEFT, padx=(0, 2))
+
+        self.to_end_button = ttk.Button(toolbar, text="⏭", width=3, command=self._jump_offline_end)
+        self.to_end_button.pack(side=tk.LEFT, padx=(0, 12))
 
         self.pause_view_button = ttk.Button(toolbar, text="Pausar vista", command=self._toggle_visual_pause)
         self.pause_view_button.pack(side=tk.LEFT, padx=(0, 12))
@@ -397,7 +461,7 @@ class PitchViewerApp(tk.Tk):
         footer = ttk.Label(
             root,
             text=(
-                "Etapa 7: ajustes visuales, rangos vocales, seguimiento dinámico y bloques de nota alcanzada. "
+                "v0.7.1: controles play/pausa/stop/record, grabación offline y Torchcrepe full solo offline si no hay CUDA. "
                 "Usa audífonos para evitar que el micrófono capture los parlantes."
             ),
             anchor="w",
@@ -683,6 +747,36 @@ class PitchViewerApp(tk.Tk):
             self.start_audio()
 
     def start_audio(self) -> None:
+        """Inicia o reanuda captura desde micrófono.
+
+        Si estaba pausada una grabación offline, ▶ reanuda esa grabación.
+        En cualquier otro caso funciona como captura online.
+        """
+        mode = "record" if self.is_audio_paused and self.capture_mode == "record" else "online"
+        self._start_live_capture(mode=mode)
+
+    def start_recording(self) -> None:
+        """Inicia captura para análisis offline.
+
+        La grabación se mantiene en memoria y se limita a la ventana temporal
+        configurada. Al presionar stop se analiza con Torchcrepe full.
+        """
+        if self.offline_analysis_running:
+            messagebox.showinfo(
+                "Análisis offline",
+                "Ya hay un análisis offline en curso.",
+                parent=self,
+            )
+            return
+
+        self._reset_recording_buffer()
+        self.is_recording = True
+        self.offline_mode = False
+        self.offline_duration_s = 0.0
+        self.offline_cursor_s = 0.0
+        self._start_live_capture(mode="record")
+
+    def _start_live_capture(self, mode: str = "online") -> None:
         if sd is None:
             messagebox.showerror(
                 "Dependencia faltante",
@@ -697,13 +791,37 @@ class PitchViewerApp(tk.Tk):
             messagebox.showerror("Entrada no válida", "Selecciona un dispositivo de entrada.")
             return
 
-        self.stop_audio()
+        if self.is_running:
+            return
+
+        mode = "record" if mode == "record" else "online"
+        resume_elapsed = self.paused_audio_elapsed_s if self.is_audio_paused and mode == self.capture_mode else 0.0
+        clear_history = not self.is_audio_paused or mode != self.capture_mode
+
+        if mode == "online":
+            self.is_recording = False
+            self.offline_mode = False
+            self.offline_duration_s = 0.0
+            self.offline_cursor_s = 0.0
+
+        backend_id = normalize_backend_id(self.settings.detector_backend)
+        if not self._is_realtime_backend_enabled(backend_id):
+            messagebox.showwarning(
+                "Backend de detección",
+                "Torchcrepe full queda deshabilitado para tiempo real porque no se detectó CUDA.\n\n"
+                "Usa Torchcrepe tiny/YIN/Autocorrelación en vivo, o el botón ⏺ para grabar "
+                "y analizar offline con Torchcrepe full.",
+                parent=self,
+            )
+            self._set_detector_backend(BACKEND_TORCHCREPE_TINY, autosave=True, restart_if_running=False)
 
         try:
             device_info = sd.query_devices(self.selected_device_index, "input")
             self.sample_rate = int(float(device_info.get("default_samplerate", 44100)))
         except Exception:
             self.sample_rate = 44100
+
+        self._configure_frame_size_for_backend()
 
         self.audio_queue = queue.Queue(maxsize=30)
         self.pitch_queue = queue.Queue(maxsize=300)
@@ -720,14 +838,26 @@ class PitchViewerApp(tk.Tk):
                 parent=self,
             )
             self._set_detector_backend(BACKEND_AUTOCORRELATION, autosave=True, restart_if_running=False)
+            self.is_recording = False
             return
 
         self.stop_event.clear()
-        self.points.clear()
-        self.current_point = None
-        self.last_smoothed_midi = None
-        self.recent_midi_values = deque(maxlen=max(1, self.settings.median_window))
-        self.time_origin = time.perf_counter()
+
+        if clear_history:
+            self.points.clear()
+            self.current_point = None
+            self.last_smoothed_midi = None
+            self.recent_midi_values = deque(maxlen=max(1, self.settings.median_window))
+            self.time_origin = time.perf_counter()
+        else:
+            self.time_origin = time.perf_counter() - float(resume_elapsed)
+
+        self.visual_paused = False
+        self.paused_display_time_s = None
+        self.pause_view_button.configure(text="Pausar vista")
+        self.is_audio_paused = False
+        self.paused_audio_elapsed_s = 0.0
+        self.capture_mode = mode
 
         try:
             self.worker_thread = threading.Thread(target=self._pitch_worker, daemon=True)
@@ -744,15 +874,44 @@ class PitchViewerApp(tk.Tk):
             self.stream.start()
 
             self.is_running = True
-            self.audio_status_var.set(f"Audio: capturando a {self.sample_rate} Hz")
+            if mode == "record":
+                self.audio_status_var.set(
+                    f"Grabando para offline: {self.sample_rate} Hz | máx. {self.settings.time_window_s}s"
+                )
+            else:
+                self.audio_status_var.set(f"Audio: capturando a {self.sample_rate} Hz")
             self._refresh_device_label()
             self._autosave_settings()
 
         except Exception as exc:
+            self.is_recording = False
             self.stop_audio()
             messagebox.showerror("Error al iniciar audio", f"No se pudo iniciar la captura:\n\n{exc}")
 
+    def pause_audio(self) -> None:
+        """Pausa captura sin borrar puntos ni reiniciar el reloj visual."""
+        if not self.is_running:
+            return
+
+        self.paused_audio_elapsed_s = self._current_time_s()
+        self.is_audio_paused = True
+        self._stop_stream_only()
+        self.audio_status_var.set(f"Audio: pausado en {self.paused_audio_elapsed_s:.1f}s")
+
     def stop_audio(self) -> None:
+        was_recording = bool(self.is_recording)
+        self._stop_stream_only()
+        self.is_audio_paused = False
+        self.paused_audio_elapsed_s = 0.0
+        self.capture_mode = "idle"
+
+        if was_recording:
+            self.is_recording = False
+            self._finish_recording_and_analyze()
+        else:
+            self.audio_status_var.set("Audio: detenido")
+
+    def _stop_stream_only(self) -> None:
         self.is_running = False
         self.stop_event.set()
 
@@ -769,7 +928,6 @@ class PitchViewerApp(tk.Tk):
 
             self.stream = None
 
-        self.audio_status_var.set("Audio: detenido")
         self.pitch_detector = None
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
@@ -778,10 +936,232 @@ class PitchViewerApp(tk.Tk):
 
         samples = np.asarray(indata[:, 0], dtype=np.float32).copy()
 
+        if self.is_recording:
+            self._append_recorded_samples(samples)
+
         try:
             self.audio_queue.put_nowait(samples)
         except queue.Full:
             pass
+
+    def _reset_recording_buffer(self) -> None:
+        with self.recording_lock:
+            self.recorded_chunks.clear()
+            self.recorded_sample_count = 0
+
+    def _append_recorded_samples(self, samples: np.ndarray) -> None:
+        if samples.size == 0:
+            return
+
+        max_samples = max(1, int(self.sample_rate * max(1, int(self.settings.time_window_s))))
+        chunk = np.asarray(samples, dtype=np.float32).copy()
+
+        with self.recording_lock:
+            self.recorded_chunks.append(chunk)
+            self.recorded_sample_count += int(chunk.size)
+
+            while self.recorded_sample_count > max_samples and self.recorded_chunks:
+                overflow = self.recorded_sample_count - max_samples
+                first = self.recorded_chunks[0]
+
+                if overflow >= first.size:
+                    removed = self.recorded_chunks.popleft()
+                    self.recorded_sample_count -= int(removed.size)
+                else:
+                    self.recorded_chunks[0] = first[int(overflow) :].copy()
+                    self.recorded_sample_count -= int(overflow)
+                    break
+
+    def _get_recorded_audio(self) -> np.ndarray:
+        with self.recording_lock:
+            if not self.recorded_chunks:
+                return np.zeros(0, dtype=np.float32)
+            return np.concatenate(list(self.recorded_chunks)).astype(np.float32, copy=False)
+
+    def _finish_recording_and_analyze(self) -> None:
+        audio = self._get_recorded_audio()
+        if audio.size < max(1024, self.sample_rate // 4):
+            self.audio_status_var.set("Grabación: demasiado corta para analizar")
+            return
+
+        if self.offline_analysis_running:
+            self.audio_status_var.set("Análisis offline: ya en curso")
+            return
+
+        self.offline_analysis_running = True
+        self.audio_status_var.set(
+            f"Análisis offline: Torchcrepe full sobre {audio.size / max(1, self.sample_rate):.1f}s"
+        )
+
+        thread = threading.Thread(
+            target=self._offline_analysis_worker,
+            args=(audio, int(self.sample_rate)),
+            daemon=True,
+        )
+        thread.start()
+
+    def _offline_analysis_worker(self, audio: np.ndarray, sample_rate: int) -> None:
+        try:
+            points = self._analyze_audio_offline_with_torchcrepe_full(audio, sample_rate)
+            duration_s = float(audio.size) / float(max(1, sample_rate))
+            self.offline_analysis_queue.put(("ok", (points, duration_s)))
+        except Exception as exc:
+            self.offline_analysis_queue.put(("error", f"{type(exc).__name__}: {exc}"))
+
+    def _consume_offline_analysis_results(self) -> None:
+        while True:
+            try:
+                status, payload = self.offline_analysis_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            self.offline_analysis_running = False
+
+            if status == "error":
+                self.audio_status_var.set("Análisis offline: error")
+                messagebox.showerror(
+                    "Análisis offline",
+                    f"No se pudo analizar la grabación con Torchcrepe full:\n\n{payload}",
+                    parent=self,
+                )
+                return
+
+            points, duration_s = payload  # type: ignore[misc]
+            self.points = deque(points, maxlen=20000)
+            self.offline_mode = True
+            self.offline_duration_s = float(duration_s)
+            self.offline_cursor_s = float(duration_s)
+            self.current_point = self._point_at_time(self.offline_cursor_s)
+            self.audio_status_var.set(
+                f"Offline: {len(points)} puntos analizados con Torchcrepe full | duración {duration_s:.1f}s"
+            )
+
+    def _analyze_audio_offline_with_torchcrepe_full(self, audio: np.ndarray, sample_rate: int) -> list[PitchPoint]:
+        from .detection.torchcrepe_detector import TorchcrepeDetector
+
+        with self.settings_lock:
+            settings = AppSettings(**self.settings.__dict__)
+
+        frame_size = max(8192, int(round(sample_rate * 0.35)))
+        hop_size = max(256, int(round(sample_rate * 0.05)))
+        detector = TorchcrepeDetector(sample_rate=sample_rate, frame_size=frame_size, model="full")
+        if hasattr(detector, "min_interval_s"):
+            detector.min_interval_s = 0.0
+
+        detect_min_hz = max(MIN_DETECTABLE_HZ, midi_to_freq(settings.min_midi - 8, settings.a4_hz))
+        detect_max_hz = min(MAX_DETECTABLE_HZ, midi_to_freq(settings.max_midi + 8, settings.a4_hz))
+
+        x = np.asarray(audio, dtype=np.float32)
+        if x.size < frame_size:
+            x = np.pad(x, (0, frame_size - x.size), mode="constant")
+
+        points: list[PitchPoint] = []
+        last_smoothed: Optional[float] = None
+        recent_values: deque[float] = deque(maxlen=max(1, int(settings.median_window)))
+
+        for end_idx in range(frame_size, x.size + 1, hop_size):
+            frame = x[end_idx - frame_size : end_idx]
+            time_s = min(float(end_idx) / float(sample_rate), float(audio.size) / float(sample_rate))
+            point, last_smoothed = self._estimate_pitch_point_from_frame(
+                frame=frame,
+                time_s=time_s,
+                detector=detector,
+                settings=settings,
+                detect_min_hz=detect_min_hz,
+                detect_max_hz=detect_max_hz,
+                last_smoothed_midi=last_smoothed,
+                recent_values=recent_values,
+            )
+            points.append(point)
+
+        if points and points[-1].time_s < float(audio.size) / float(sample_rate):
+            frame = x[-frame_size:]
+            point, last_smoothed = self._estimate_pitch_point_from_frame(
+                frame=frame,
+                time_s=float(audio.size) / float(sample_rate),
+                detector=detector,
+                settings=settings,
+                detect_min_hz=detect_min_hz,
+                detect_max_hz=detect_max_hz,
+                last_smoothed_midi=last_smoothed,
+                recent_values=recent_values,
+            )
+            points.append(point)
+
+        return points
+
+    def _estimate_pitch_point_from_frame(
+        self,
+        frame: np.ndarray,
+        time_s: float,
+        detector,
+        settings: AppSettings,
+        detect_min_hz: float,
+        detect_max_hz: float,
+        last_smoothed_midi: Optional[float],
+        recent_values: deque[float],
+    ) -> tuple[PitchPoint, Optional[float]]:
+        rms = float(np.sqrt(np.mean(frame * frame)))
+        estimate = detector.estimate(frame, detect_min_hz, detect_max_hz)
+        freq_hz = float(estimate.freq_hz)
+        confidence = float(estimate.confidence)
+
+        voiced = (
+            detect_min_hz <= freq_hz <= detect_max_hz
+            and confidence >= settings.confidence_threshold
+            and rms >= settings.rms_threshold
+        )
+
+        raw_midi = float("nan")
+        if voiced:
+            raw_midi = freq_to_midi(freq_hz, settings.a4_hz)
+
+            if settings.octave_guard and last_smoothed_midi is not None:
+                raw_midi = self._correct_octave_jump(raw_midi, last_smoothed_midi)
+
+            recent_values.append(raw_midi)
+            midi_stable = float(np.median(np.asarray(recent_values, dtype=np.float64)))
+
+            if last_smoothed_midi is None:
+                midi_smooth = midi_stable
+            else:
+                jump = abs(midi_stable - last_smoothed_midi)
+                if jump > settings.max_jump_semitones and confidence < max(0.75, settings.confidence_threshold):
+                    midi_smooth = last_smoothed_midi
+                else:
+                    midi_smooth = (
+                        settings.smoothing_factor * midi_stable
+                        + (1.0 - settings.smoothing_factor) * last_smoothed_midi
+                    )
+
+            last_smoothed_midi = midi_smooth
+        else:
+            midi_smooth = float("nan")
+            if rms < settings.rms_threshold * 0.5:
+                last_smoothed_midi = None
+                recent_values.clear()
+
+        return (
+            PitchPoint(
+                time_s=float(time_s),
+                freq_hz=freq_hz,
+                midi_float=midi_smooth,
+                raw_midi_float=raw_midi,
+                confidence=confidence,
+                rms=rms,
+                voiced=voiced,
+            ),
+            last_smoothed_midi,
+        )
+
+    def _point_at_time(self, time_s: float) -> Optional[PitchPoint]:
+        best: Optional[PitchPoint] = None
+        for point in self.points:
+            if point.time_s <= time_s:
+                best = point
+            else:
+                break
+        return best
 
     def _pitch_worker(self) -> None:
         rolling = np.zeros(0, dtype=np.float32)
@@ -900,6 +1280,19 @@ class PitchViewerApp(tk.Tk):
         self.backend_status_var.set(f"Backend: {backend_label(self.active_backend_id)}")
         return detector
 
+    def _configure_frame_size_for_backend(self) -> None:
+        with self.settings_lock:
+            backend_id = normalize_backend_id(self.settings.detector_backend)
+
+        if backend_id in {BACKEND_TORCHCREPE_TINY, BACKEND_TORCHCREPE_FULL}:
+            # CREPE necesita una ventana de análisis más larga que la
+            # autocorrelación/YIN para ser estable. Se mantiene el bloque de
+            # audio corto, pero el buffer rodante crece para este backend.
+            self.frame_size = max(8192, int(round(self.sample_rate * 0.35)))
+        else:
+            self.frame_size = 4096
+
+
     def _set_detector_backend(
         self,
         backend_id: str,
@@ -907,6 +1300,15 @@ class PitchViewerApp(tk.Tk):
         restart_if_running: bool = True,
     ) -> None:
         backend_id = normalize_backend_id(backend_id)
+        if not self._is_realtime_backend_enabled(backend_id):
+            messagebox.showwarning(
+                "Backend de detección",
+                "Torchcrepe full está disponible para análisis offline, pero queda deshabilitado "
+                "como backend vivo porque no se detectó CUDA.",
+                parent=self,
+            )
+            backend_id = BACKEND_TORCHCREPE_TINY
+
         was_running = self.is_running and restart_if_running
 
         if was_running:
@@ -932,6 +1334,7 @@ class PitchViewerApp(tk.Tk):
         return min(candidates, key=lambda value: abs(value - previous_midi))
 
     def _ui_loop(self) -> None:
+        self._consume_offline_analysis_results()
         self._consume_pitch_points()
         self._update_status()
         self._redraw_canvas()
@@ -950,6 +1353,9 @@ class PitchViewerApp(tk.Tk):
                 if not math.isnan(point.midi_float):
                     self._update_dynamic_center(point.midi_float)
 
+        if self.offline_mode:
+            return
+
         now = self._current_time_s()
         with self.settings_lock:
             max_history = max(90.0, self.settings.time_window_s * 4.0)
@@ -958,8 +1364,14 @@ class PitchViewerApp(tk.Tk):
             self.points.popleft()
 
     def _current_time_s(self) -> float:
+        if self.offline_mode:
+            return self.offline_cursor_s
+
         if self.is_running:
             return time.perf_counter() - self.time_origin
+
+        if self.is_audio_paused:
+            return self.paused_audio_elapsed_s
 
         if self.points:
             return self.points[-1].time_s
@@ -1021,11 +1433,52 @@ class PitchViewerApp(tk.Tk):
         self.recent_midi_values.clear()
 
     def _set_time_window(self, seconds: int) -> None:
+        seconds = max(1, min(60, int(seconds)))
         with self.settings_lock:
-            self.settings.time_window_s = int(seconds)
-        self.time_window_var.set(int(seconds))
+            self.settings.time_window_s = seconds
+        self.time_window_var.set(seconds)
         self._refresh_status_labels()
         self._autosave_settings()
+
+    def _transport_forward(self) -> None:
+        if self.offline_mode:
+            with self.settings_lock:
+                step = max(0.5, self.settings.time_window_s / 2.0)
+            self.offline_cursor_s = min(self.offline_duration_s, self.offline_cursor_s + step)
+            self.current_point = self._point_at_time(self.offline_cursor_s)
+            self.audio_status_var.set(f"Offline: cursor {self.offline_cursor_s:.1f}s / {self.offline_duration_s:.1f}s")
+            return
+
+        with self.settings_lock:
+            seconds = max(1, int(self.settings.time_window_s) - 1)
+        self._set_time_window(seconds)
+
+    def _transport_backward(self) -> None:
+        if self.offline_mode:
+            with self.settings_lock:
+                step = max(0.5, self.settings.time_window_s / 2.0)
+            self.offline_cursor_s = max(0.0, self.offline_cursor_s - step)
+            self.current_point = self._point_at_time(self.offline_cursor_s)
+            self.audio_status_var.set(f"Offline: cursor {self.offline_cursor_s:.1f}s / {self.offline_duration_s:.1f}s")
+            return
+
+        with self.settings_lock:
+            seconds = min(60, int(self.settings.time_window_s) + 1)
+        self._set_time_window(seconds)
+
+    def _jump_offline_start(self) -> None:
+        if not self.offline_mode:
+            return
+        self.offline_cursor_s = 0.0
+        self.current_point = self._point_at_time(self.offline_cursor_s)
+        self.audio_status_var.set(f"Offline: cursor 0.0s / {self.offline_duration_s:.1f}s")
+
+    def _jump_offline_end(self) -> None:
+        if not self.offline_mode:
+            return
+        self.offline_cursor_s = self.offline_duration_s
+        self.current_point = self._point_at_time(self.offline_cursor_s)
+        self.audio_status_var.set(f"Offline: cursor {self.offline_cursor_s:.1f}s / {self.offline_duration_s:.1f}s")
 
     def _set_visible_range(self, min_midi: int, max_midi: int) -> None:
         if max_midi <= min_midi:
@@ -1440,16 +1893,19 @@ class PitchViewerApp(tk.Tk):
             f"Tolerancia: ±{settings.tolerance_cents} cents | Línea: {settings.pitch_line_width}px | "
             f"Seguimiento: {dynamic} | Backend: {backend_label(settings.detector_backend)}"
         )
-        self.backend_status_var.set(f"Backend: {backend_label(settings.detector_backend)}")
+        cuda_text = "CUDA: sí" if self.cuda_available else "CUDA: no"
+        full_text = "full vivo" if self.torchcrepe_full_realtime_enabled else "full offline"
+        self.backend_status_var.set(f"Backend: {backend_label(settings.detector_backend)} | {cuda_text} | {full_text}")
 
     def _update_status(self) -> None:
         now = self._current_time_s()
-        point = self.current_point
+        point = self._point_at_time(now) if self.offline_mode else self.current_point
 
         with self.settings_lock:
             settings = AppSettings(**self.settings.__dict__)
 
-        if point is None or not point.voiced or now - point.time_s > 0.75:
+        stale = False if self.offline_mode else (point is not None and now - point.time_s > 0.75)
+        if point is None or not point.voiced or stale:
             self.note_status_var.set("Nota alcanzada: —")
             self.freq_status_var.set("Frecuencia: —")
             self.cents_status_var.set("Desviación: —")
@@ -1920,9 +2376,11 @@ class PitchViewerApp(tk.Tk):
 
             previous = (point, x, y)
 
-        if not self.visual_paused and self.current_point is not None and self.current_point.voiced:
-            if self._current_time_s() - self.current_point.time_s <= 0.75:
-                midi_value = self.current_point.midi_float
+        marker_point = self._point_at_time(self.offline_cursor_s) if self.offline_mode else self.current_point
+        marker_allowed = self.offline_mode or not self.visual_paused
+        if marker_allowed and marker_point is not None and marker_point.voiced:
+            if self.offline_mode or self._current_time_s() - marker_point.time_s <= 0.75:
+                midi_value = marker_point.midi_float
                 if visible_min_midi - 0.5 <= midi_value <= visible_max_midi + 0.5:
                     y = midi_to_y(midi_value)
                     canvas.create_oval(
@@ -1974,6 +2432,12 @@ class PitchViewerApp(tk.Tk):
         ]
         if settings.dynamic_tracking:
             lines.append("Seguimiento dinámico activo")
+        if self.is_recording:
+            lines.append("Grabando para análisis offline")
+        if self.offline_analysis_running:
+            lines.append("Analizando offline con Torchcrepe full")
+        if self.offline_mode:
+            lines.append(f"Offline: {self.offline_cursor_s:.1f}s / {self.offline_duration_s:.1f}s")
         if self.visual_paused:
             lines.append("Vista pausada")
 
@@ -2015,14 +2479,15 @@ class PitchViewerApp(tk.Tk):
     def _show_about(self) -> None:
         messagebox.showinfo(
             "Acerca de",
-            "Monitor de afinación vocal - Etapa 6\n\n"
-            "Backends incluidos: Autocorrelación FFT y YIN CMND con NumPy.\n"
-            "Backends opcionales: Torchcrepe tiny/full, si instalas torch y torchcrepe.\n"
+            "Monitor de afinación vocal - v0.7.1\n\n"
+            "Incluye transporte play/pausa/stop/record y análisis offline con Torchcrepe full.\n"
+            "Si no hay CUDA, Torchcrepe full queda deshabilitado en vivo, pero sigue disponible offline.\n"
             "La configuración guarda también el backend seleccionado.\n\n"
             f"Archivo de configuración:\n{self.settings_path}",
         )
 
     def _on_close(self) -> None:
         self._save_settings_now(show_message=False)
-        self.stop_audio()
+        self.is_recording = False
+        self._stop_stream_only()
         self.destroy()

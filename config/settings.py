@@ -185,9 +185,7 @@ def normalize_settings(settings: AppSettings) -> AppSettings:
     if settings.note_language not in VALID_NOTE_LANGUAGES:
         settings.note_language = "es"
 
-    settings.time_window_s = _coerce_int(settings.time_window_s, 10)
-    if settings.time_window_s not in TIME_WINDOWS:
-        settings.time_window_s = 10
+    settings.time_window_s = _clamp_int(settings.time_window_s, 1, 60, 10)
 
     settings.min_midi = _clamp_int(settings.min_midi, MIN_MIDI_CHOICE, MAX_MIDI_CHOICE - 1, DEFAULT_MIN_MIDI)
     settings.max_midi = _clamp_int(settings.max_midi, MIN_MIDI_CHOICE + 1, MAX_MIDI_CHOICE, DEFAULT_MAX_MIDI)
