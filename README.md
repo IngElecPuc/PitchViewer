@@ -1,6 +1,6 @@
-# Pitch Viewer v0.9.5
+# Pitch Viewer v0.10.0
 
-Aplicación de escritorio en Tkinter para monitoreo de afinación vocal, análisis offline de pitch, producción de archivos karaoke `.pvk` y separación offline de fuentes de audio.
+Aplicación de escritorio en Tkinter para monitoreo de afinación vocal, análisis offline de pitch, producción de archivos karaoke `.pvk`, karaoke play contra targets y separación offline de fuentes de audio.
 
 ## 1. Instalación base
 
@@ -33,7 +33,6 @@ pip install -r optional-requirements-torchcrepe.txt
 Diagnósticos:
 
 ```bash
-python .\tools\diagnose_torchcrepe.py
 python .\tools\diagnose_pitchviewer_backends.py
 python .\tools\diagnose_live_torchcrepe.py --backend all
 ```
@@ -54,13 +53,13 @@ Ese instalador deja lista la ruta estable:
 Demucs + soundfile + imageio-ffmpeg
 ```
 
-La app no depende de TorchCodec para ejecutar Demucs. En Windows + Python reciente, `torchaudio.load` o `torchaudio.save` pueden intentar usar TorchCodec y fallar por DLLs o compatibilidad binaria. Para evitarlo, Pitch Viewer ejecuta Demucs mediante un runner propio:
+La app no depende de TorchCodec para ejecutar Demucs. En Windows + Python reciente, `torchaudio.load` o `torchaudio.save` pueden intentar usar TorchCodec y fallar por DLLs o compatibilidad binaria. Pitch Viewer ejecuta Demucs mediante:
 
 ```text
 tools/run_demucs_soundfile.py
 ```
 
-Ese runner reemplaza la carga y el guardado de audio de Demucs por `soundfile`. Por eso la app primero convierte MP3/M4A/MP4/FLAC a WAV temporal usando FFmpeg, Demucs procesa ese WAV limpio, y los stems se escriben sin pasar por TorchCodec.
+Ese runner reemplaza la carga y el guardado de audio de Demucs por `soundfile`. La app primero convierte MP3/M4A/MP4/FLAC a WAV temporal usando FFmpeg, Demucs procesa ese WAV limpio, y los stems se escriben sin pasar por TorchCodec.
 
 Instalación directa mínima equivalente:
 
@@ -187,7 +186,53 @@ lyrics.txt    opcional
 lyrics.lrc    opcional
 ```
 
-## 6. Separación IA offline
+## 6. Karaoke play
+
+Karaoke play consume un `.pvk` ya generado y permite cantar contra los segmentos objetivo.
+
+Flujo:
+
+```text
+1. Karaoke > Mostrar/ocultar panel karaoke
+2. Abrir .pvk...
+3. Mover el slider al punto de inicio deseado
+4. ▶ Play
+5. Cantar sobre los targets azules
+6. ⏸ Pausa o ⏹ Stop
+```
+
+Durante play:
+
+```text
+Target azul
+    nota objetivo guardada en el .pvk
+
+Línea de pitch
+    voz actual capturada por micrófono
+
+Bloques alcanzados
+    notas que tu voz realmente alcanzó según tolerancia actual
+```
+
+El puntaje simple muestra:
+
+```text
+porcentaje dentro de tolerancia
+error medio firmado en cents
+error absoluto medio en cents
+hits / fallos / frames sin voz
+tendencia: alto / bajo / centrado
+```
+
+La tolerancia sigue saliendo de:
+
+```text
+Afinación > Tolerancia
+```
+
+Por eso puedes hacer el juego más estricto o más permisivo sin regenerar el `.pvk`.
+
+## 7. Separación IA offline
 
 Panel:
 
@@ -220,7 +265,7 @@ Para mezcla más flexible:
 4stems: vocals + drums + bass + other
 ```
 
-## 7. Audio Separator / UVR
+## 8. Audio Separator / UVR
 
 Audio Separator / UVR queda como motor experimental. En Windows + Python 3.14 puede fallar por dependencias nativas como `diffq-fixed`. Por eso no está en el requirements principal de separación.
 
@@ -237,46 +282,3 @@ python .\tools\list_audio_separator_models.py
 ```
 
 Si falla, Demucs sigue siendo la ruta estable.
-
-## 8. Diagnósticos útiles
-
-```bash
-python .\tools\diagnose_separation_dependencies.py
-python .\tools\diagnose_demucs_track.py "ruta\cancion.mp3" --clip-seconds 20
-python .\tools\diagnose_pitchviewer_backends.py
-python .\tools\diagnose_live_torchcrepe.py --backend all
-```
-
-## 9. Control de versiones
-
-Esta entrega queda como `v0.9.5`, porque corrige la visualización y clasificación de stems sobre la base funcional de `v0.9.4`.
-
-```bash
-git add .
-git commit -m "fix: show gain slider for each separated stem"
-git tag v0.9.5
-```
-
-## 10. Versiones relevantes
-
-```text
-v0.7.1: transporte offline corto
-v0.8.0: calibración vocal y análisis offline
-v0.8.1: backend vivo y backend offline separados
-v0.8.2: ajustes visuales y overlay de calibración
-v0.9.0: karaoke producción .pvk
-v0.9.1: letras en panel lateral
-v0.9.2: barra de progreso para análisis karaoke
-v0.9.3: panel de separación IA
-v0.9.4: separación offline robusta, preconversión a WAV, runner Demucs con soundfile para lectura/escritura, exportación MP3/WAV y diagnóstico por canción
-v0.9.5: corrección de stems 2stems; no_vocals ya no se clasifica como vocals y la UI muestra una barra de ganancia por cada stem
-```
-
-### Ganancias por stem
-
-Después de separar una canción, el panel de separación muestra una barra por cada stem detectado.
-
-- En modo `2stems`: `Voz` y `Instrumental/no_vocals`.
-- En modo `4stems`: `Voz`, `Batería`, `Bajo` y `Otros instrumentos`.
-
-Cada barra controla la ganancia de ese stem en la mezcla exportada. `100%` conserva el volumen original, `0%` silencia el stem y valores mayores amplifican antes de normalizar si hay clipping.
