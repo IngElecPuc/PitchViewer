@@ -38,6 +38,7 @@ from .constants import (
     MIN_DETECTABLE_HZ,
     MIN_MIDI_CHOICE,
     RANGE_PRESETS,
+    VOCAL_RANGE_PRESETS,
     TIME_WINDOWS,
     TOLERANCE_OPTIONS,
 )
@@ -76,7 +77,7 @@ class PitchViewerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
 
-        self.title("Monitor de afinación vocal - Etapa 6")
+        self.title("Monitor de afinación vocal - Etapa 7")
 
         self.settings_load_result = load_settings()
         self.settings = self.settings_load_result.settings
@@ -120,6 +121,16 @@ class PitchViewerApp(tk.Tk):
         self.show_tolerance_bands_var = tk.BooleanVar(value=self.settings.show_tolerance_bands)
         self.show_center_lines_var = tk.BooleanVar(value=self.settings.show_center_lines)
         self.detector_backend_var = tk.StringVar(value=normalize_backend_id(self.settings.detector_backend))
+        self.dynamic_tracking_var = tk.BooleanVar(value=self.settings.dynamic_tracking)
+        self.show_achieved_blocks_var = tk.BooleanVar(value=self.settings.show_achieved_blocks)
+        self.theme_var = tk.StringVar(value=self.settings.theme_name)
+
+        self.visual_paused = False
+        self.paused_display_time_s: Optional[float] = None
+        self.dynamic_center_midi: Optional[float] = None
+        self._range_drag_start_y: Optional[int] = None
+        self._range_drag_start_min_midi: Optional[int] = None
+        self._range_drag_start_max_midi: Optional[int] = None
 
         self.note_status_var = tk.StringVar(value="Nota: —")
         self.freq_status_var = tk.StringVar(value="Frecuencia: —")
@@ -193,6 +204,12 @@ class PitchViewerApp(tk.Tk):
         view_menu.add_cascade(label="Ventana temporal", menu=time_menu)
 
         range_menu = tk.Menu(view_menu, tearoff=False)
+        for label, min_midi, max_midi in VOCAL_RANGE_PRESETS:
+            range_menu.add_command(
+                label=label,
+                command=lambda lo=min_midi, hi=max_midi: self._set_visible_range(lo, hi),
+            )
+        range_menu.add_separator()
         for label, min_midi, max_midi in RANGE_PRESETS:
             range_menu.add_command(
                 label=label,
@@ -204,6 +221,14 @@ class PitchViewerApp(tk.Tk):
         view_menu.add_cascade(label="Rango visible", menu=range_menu)
         view_menu.add_separator()
         view_menu.add_checkbutton(
+            label="Seguimiento dinámico de voz",
+            variable=self.dynamic_tracking_var,
+            command=self._toggle_dynamic_tracking,
+        )
+        view_menu.add_command(label="Centrar rango en nota actual", command=self._center_range_on_current_pitch)
+        view_menu.add_command(label="Pausar/reanudar visualización", command=self._toggle_visual_pause)
+        view_menu.add_separator()
+        view_menu.add_checkbutton(
             label="Mostrar bandas de tolerancia",
             variable=self.show_tolerance_bands_var,
             command=self._toggle_tolerance_bands,
@@ -213,6 +238,26 @@ class PitchViewerApp(tk.Tk):
             variable=self.show_center_lines_var,
             command=self._toggle_center_lines,
         )
+        view_menu.add_checkbutton(
+            label="Mostrar bloques alcanzados",
+            variable=self.show_achieved_blocks_var,
+            command=self._toggle_achieved_blocks,
+        )
+        view_menu.add_command(label="Grosor de línea de pitch...", command=self._open_pitch_line_width_dialog)
+        theme_menu = tk.Menu(view_menu, tearoff=False)
+        theme_menu.add_radiobutton(
+            label="Oscuro",
+            variable=self.theme_var,
+            value="dark",
+            command=lambda: self._set_theme("dark"),
+        )
+        theme_menu.add_radiobutton(
+            label="Claro",
+            variable=self.theme_var,
+            value="light",
+            command=lambda: self._set_theme("light"),
+        )
+        view_menu.add_cascade(label="Apariencia", menu=theme_menu)
         menubar.add_cascade(label="Vista", menu=view_menu)
 
         scale_menu = tk.Menu(menubar, tearoff=False)
@@ -305,7 +350,10 @@ class PitchViewerApp(tk.Tk):
         self.start_button.pack(side=tk.LEFT, padx=(0, 4))
 
         self.stop_button = ttk.Button(toolbar, text="Detener", command=self.stop_audio)
-        self.stop_button.pack(side=tk.LEFT, padx=(0, 12))
+        self.stop_button.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.pause_view_button = ttk.Button(toolbar, text="Pausar vista", command=self._toggle_visual_pause)
+        self.pause_view_button.pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Button(toolbar, text="Fuente...", command=self._choose_input_device).pack(side=tk.LEFT, padx=(0, 12))
 
@@ -336,11 +384,20 @@ class PitchViewerApp(tk.Tk):
             highlightthickness=0,
         )
         self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.bind("<MouseWheel>", self._on_canvas_mousewheel)
+        self.canvas.bind("<Button-4>", lambda event: self._on_canvas_wheel_linux(event, 1))
+        self.canvas.bind("<Button-5>", lambda event: self._on_canvas_wheel_linux(event, -1))
+        self.canvas.bind("<ButtonPress-2>", self._on_range_drag_start)
+        self.canvas.bind("<B2-Motion>", self._on_range_drag_move)
+        self.canvas.bind("<ButtonRelease-2>", self._on_range_drag_end)
+        self.canvas.bind("<ButtonPress-3>", self._on_range_drag_start)
+        self.canvas.bind("<B3-Motion>", self._on_range_drag_move)
+        self.canvas.bind("<ButtonRelease-3>", self._on_range_drag_end)
 
         footer = ttk.Label(
             root,
             text=(
-                "Etapa 6: backends seleccionables de pitch; mantiene persistencia, estabilización, tolerancia y exportación CSV. "
+                "Etapa 7: ajustes visuales, rangos vocales, seguimiento dinámico y bloques de nota alcanzada. "
                 "Usa audífonos para evitar que el micrófono capture los parlantes."
             ),
             anchor="w",
@@ -490,6 +547,9 @@ class PitchViewerApp(tk.Tk):
         self.show_out_of_scale_var.set(settings.show_out_of_scale)
         self.show_tolerance_bands_var.set(settings.show_tolerance_bands)
         self.show_center_lines_var.set(settings.show_center_lines)
+        self.show_achieved_blocks_var.set(settings.show_achieved_blocks)
+        self.dynamic_tracking_var.set(settings.dynamic_tracking)
+        self.theme_var.set(settings.theme_name)
         self.detector_backend_var.set(normalize_backend_id(settings.detector_backend))
 
         try:
@@ -887,6 +947,8 @@ class PitchViewerApp(tk.Tk):
             self.points.append(point)
             if point.voiced:
                 self.current_point = point
+                if not math.isnan(point.midi_float):
+                    self._update_dynamic_center(point.midi_float)
 
         now = self._current_time_s()
         with self.settings_lock:
@@ -903,6 +965,54 @@ class PitchViewerApp(tk.Tk):
             return self.points[-1].time_s
 
         return 0.0
+
+    def _display_time_s(self) -> float:
+        if self.visual_paused and self.paused_display_time_s is not None:
+            return self.paused_display_time_s
+        return self._current_time_s()
+
+    def _update_dynamic_center(self, midi_value: float) -> None:
+        with self.settings_lock:
+            enabled = self.settings.dynamic_tracking
+            min_midi = self.settings.min_midi
+            max_midi = self.settings.max_midi
+
+        if not enabled:
+            return
+
+        span = max(12.0, float(max_midi - min_midi))
+        low_limit = MIN_MIDI_CHOICE + span / 2.0
+        high_limit = MAX_MIDI_CHOICE - span / 2.0
+        target = max(low_limit, min(high_limit, midi_value))
+
+        if self.dynamic_center_midi is None:
+            self.dynamic_center_midi = target
+        else:
+            self.dynamic_center_midi = 0.12 * target + 0.88 * self.dynamic_center_midi
+
+    def _effective_visible_range(self, settings: AppSettings) -> tuple[int, int]:
+        min_midi = int(settings.min_midi)
+        max_midi = int(settings.max_midi)
+
+        if not settings.dynamic_tracking or self.dynamic_center_midi is None:
+            return min_midi, max_midi
+
+        span = max(12, max_midi - min_midi)
+        center = int(round(self.dynamic_center_midi))
+        dynamic_min = center - span // 2
+        dynamic_max = dynamic_min + span
+        return self._clamp_visible_range(dynamic_min, dynamic_max)
+
+    @staticmethod
+    def _clamp_visible_range(min_midi: int, max_midi: int) -> tuple[int, int]:
+        span = max(1, max_midi - min_midi)
+        if min_midi < MIN_MIDI_CHOICE:
+            min_midi = MIN_MIDI_CHOICE
+            max_midi = min_midi + span
+        if max_midi > MAX_MIDI_CHOICE:
+            max_midi = MAX_MIDI_CHOICE
+            min_midi = max_midi - span
+        return int(min_midi), int(max_midi)
 
     def _clear_history(self) -> None:
         self.points.clear()
@@ -925,7 +1035,66 @@ class PitchViewerApp(tk.Tk):
             self.settings.min_midi = int(min_midi)
             self.settings.max_midi = int(max_midi)
 
+        self.dynamic_center_midi = None
         self._refresh_status_labels()
+        self._autosave_settings()
+
+    def _on_canvas_mousewheel(self, event) -> None:
+        delta = 1 if event.delta > 0 else -1
+        self._zoom_visible_range(delta)
+
+    def _on_canvas_wheel_linux(self, event, delta: int) -> None:
+        self._zoom_visible_range(delta)
+
+    def _zoom_visible_range(self, delta: int) -> None:
+        with self.settings_lock:
+            min_midi = self.settings.min_midi
+            max_midi = self.settings.max_midi
+
+        span = max(2, max_midi - min_midi)
+        center = (min_midi + max_midi) / 2.0
+
+        if delta > 0:
+            new_span = max(8, span - 2)
+        else:
+            new_span = min(MAX_MIDI_CHOICE - MIN_MIDI_CHOICE, span + 2)
+
+        new_min = int(round(center - new_span / 2.0))
+        new_max = new_min + int(new_span)
+        new_min, new_max = self._clamp_visible_range(new_min, new_max)
+        self._set_visible_range(new_min, new_max)
+
+    def _on_range_drag_start(self, event) -> None:
+        self._range_drag_start_y = int(event.y)
+        with self.settings_lock:
+            self._range_drag_start_min_midi = int(self.settings.min_midi)
+            self._range_drag_start_max_midi = int(self.settings.max_midi)
+
+    def _on_range_drag_move(self, event) -> None:
+        if (
+            self._range_drag_start_y is None
+            or self._range_drag_start_min_midi is None
+            or self._range_drag_start_max_midi is None
+        ):
+            return
+
+        height = max(1, self.canvas.winfo_height() - 56)
+        span = self._range_drag_start_max_midi - self._range_drag_start_min_midi
+        semitone_delta = int(round((int(event.y) - self._range_drag_start_y) / height * span))
+        new_min = self._range_drag_start_min_midi + semitone_delta
+        new_max = self._range_drag_start_max_midi + semitone_delta
+        new_min, new_max = self._clamp_visible_range(new_min, new_max)
+
+        with self.settings_lock:
+            self.settings.min_midi = new_min
+            self.settings.max_midi = new_max
+
+        self._refresh_status_labels()
+
+    def _on_range_drag_end(self, event) -> None:
+        self._range_drag_start_y = None
+        self._range_drag_start_min_midi = None
+        self._range_drag_start_max_midi = None
         self._autosave_settings()
 
     def _open_range_dialog(self) -> None:
@@ -1027,6 +1196,84 @@ class PitchViewerApp(tk.Tk):
         self._refresh_status_labels()
         self._autosave_settings()
 
+
+    def _toggle_achieved_blocks(self) -> None:
+        with self.settings_lock:
+            self.settings.show_achieved_blocks = bool(self.show_achieved_blocks_var.get())
+
+        self._refresh_status_labels()
+        self._autosave_settings()
+
+    def _toggle_dynamic_tracking(self) -> None:
+        enabled = bool(self.dynamic_tracking_var.get())
+        with self.settings_lock:
+            self.settings.dynamic_tracking = enabled
+
+        if not enabled:
+            self.dynamic_center_midi = None
+
+        self._refresh_status_labels()
+        self._autosave_settings()
+
+    def _set_theme(self, theme_name: str) -> None:
+        if theme_name not in {"dark", "light"}:
+            return
+
+        with self.settings_lock:
+            self.settings.theme_name = theme_name
+
+        self.theme_var.set(theme_name)
+        self.canvas.configure(bg=self._palette(self.settings)["canvas_bg"])
+        self._refresh_status_labels()
+        self._autosave_settings()
+
+    def _open_pitch_line_width_dialog(self) -> None:
+        with self.settings_lock:
+            initial = self.settings.pitch_line_width
+
+        width = simpledialog.askinteger(
+            "Grosor de línea de pitch",
+            "Grosor visual de la línea de pitch, entre 1 y 8:",
+            initialvalue=initial,
+            minvalue=1,
+            maxvalue=8,
+            parent=self,
+        )
+        if width is None:
+            return
+
+        with self.settings_lock:
+            self.settings.pitch_line_width = max(1, min(8, int(width)))
+
+        self._refresh_status_labels()
+        self._autosave_settings()
+
+    def _toggle_visual_pause(self) -> None:
+        if self.visual_paused:
+            self.visual_paused = False
+            self.paused_display_time_s = None
+            self.pause_view_button.configure(text="Pausar vista")
+            return
+
+        self.visual_paused = True
+        self.paused_display_time_s = self._current_time_s()
+        self.pause_view_button.configure(text="Reanudar vista")
+
+    def _center_range_on_current_pitch(self) -> None:
+        point = self.current_point
+        if point is None or not point.voiced or math.isnan(point.midi_float):
+            messagebox.showinfo("Centrar rango", "No hay una nota actual confiable para centrar.", parent=self)
+            return
+
+        with self.settings_lock:
+            span = max(12, self.settings.max_midi - self.settings.min_midi)
+
+        center = int(round(point.midi_float))
+        min_midi = center - span // 2
+        max_midi = min_midi + span
+        min_midi, max_midi = self._clamp_visible_range(min_midi, max_midi)
+        self._set_visible_range(min_midi, max_midi)
+
     def _set_a4(self, hz: float) -> None:
         if hz <= 0:
             return
@@ -1057,7 +1304,7 @@ class PitchViewerApp(tk.Tk):
 
     def _set_tolerance(self, cents: int) -> None:
         cents = int(cents)
-        cents = max(1, min(99, cents))
+        cents = max(1, min(49, cents))
 
         with self.settings_lock:
             self.settings.tolerance_cents = cents
@@ -1075,7 +1322,7 @@ class PitchViewerApp(tk.Tk):
             "Tolerancia de afinación en cents:",
             initialvalue=initial,
             minvalue=1,
-            maxvalue=99,
+            maxvalue=49,
             parent=self,
         )
         if cents is None:
@@ -1187,10 +1434,11 @@ class PitchViewerApp(tk.Tk):
         self.range_status_var.set(
             f"Rango: {min_note} - {max_note} ({min_hz:.0f} - {max_hz:.0f} Hz)"
         )
+        dynamic = "on" if settings.dynamic_tracking else "off"
         self.settings_status_var.set(
             f"A4: {settings.a4_hz:.1f} Hz | Ventana: {settings.time_window_s}s | "
-            f"Tolerancia: ±{settings.tolerance_cents} cents | Mediana: {settings.median_window} | "
-            f"Backend: {backend_label(settings.detector_backend)}"
+            f"Tolerancia: ±{settings.tolerance_cents} cents | Línea: {settings.pitch_line_width}px | "
+            f"Seguimiento: {dynamic} | Backend: {backend_label(settings.detector_backend)}"
         )
         self.backend_status_var.set(f"Backend: {backend_label(settings.detector_backend)}")
 
@@ -1202,7 +1450,7 @@ class PitchViewerApp(tk.Tk):
             settings = AppSettings(**self.settings.__dict__)
 
         if point is None or not point.voiced or now - point.time_s > 0.75:
-            self.note_status_var.set("Nota: —")
+            self.note_status_var.set("Nota alcanzada: —")
             self.freq_status_var.set("Frecuencia: —")
             self.cents_status_var.set("Desviación: —")
             self.conf_status_var.set("Confianza: —")
@@ -1213,9 +1461,15 @@ class PitchViewerApp(tk.Tk):
         note_name = midi_to_note_name(nearest_midi, settings.note_language)
         cents = cents_from_nearest_note(point.midi_float)
         in_scale = nearest_midi % 12 in scale_pitch_classes(settings.scale_root, settings.scale_name)
-        scale_suffix = "" if in_scale else " | fuera de escala"
+        matched_midi = self._matched_midi(point.midi_float, settings)
 
-        self.note_status_var.set(f"Nota: {note_name}{scale_suffix}")
+        if matched_midi is not None:
+            self.note_status_var.set(f"Nota alcanzada: {midi_to_note_name(matched_midi, settings.note_language)}")
+        elif in_scale:
+            self.note_status_var.set(f"Nota alcanzada: — | cerca de {note_name} ({cents:+.1f}c)")
+        else:
+            self.note_status_var.set(f"Nota alcanzada: — | {note_name} fuera de escala")
+
         self.freq_status_var.set(f"Frecuencia: {point.freq_hz:7.2f} Hz")
         self.cents_status_var.set(f"Desviación: {cents:+6.1f} cents")
         self.conf_status_var.set(f"Confianza: {point.confidence:0.2f} | RMS: {point.rms:0.4f}")
@@ -1232,8 +1486,59 @@ class PitchViewerApp(tk.Tk):
         if abs_cents <= settings.tolerance_cents:
             return "dentro de tolerancia"
         if cents > 0:
-            return "alto"
-        return "bajo"
+            return "desafinado alto"
+        return "desafinado bajo"
+
+    @staticmethod
+    def _palette(settings: AppSettings) -> dict[str, str]:
+        if settings.theme_name == "light":
+            return {
+                "canvas_bg": "#edf2f7",
+                "plot_bg": "#dce6ee",
+                "lane_natural": "#d8e1e8",
+                "lane_accidental": "#cfd9e1",
+                "lane_out": "#c5cdd5",
+                "label_bg": "#eef3f7",
+                "label_dim_bg": "#c8d0d8",
+                "label_fg": "#111827",
+                "grid": "#b7c3cc",
+                "time_grid": "#c1ccd5",
+                "center": "#7d8a95",
+                "tolerance_fill": "#b8dcc7",
+                "tolerance_edge": "#6aa87e",
+                "current_band": "#f3d58a",
+                "pitch": "#111827",
+                "pitch_marker": "#ffffff",
+                "block_fill": "#d97706",
+                "block_outline": "#92400e",
+                "text": "#111827",
+                "legend_bg": "#ffffff",
+                "invalid": "#aeb8c2",
+            }
+
+        return {
+            "canvas_bg": "#172026",
+            "plot_bg": "#11181d",
+            "lane_natural": "#202b31",
+            "lane_accidental": "#192329",
+            "lane_out": "#10171c",
+            "label_bg": "#dfe7ee",
+            "label_dim_bg": "#697782",
+            "label_fg": "#111820",
+            "grid": "#2f3b43",
+            "time_grid": "#25323a",
+            "center": "#52616b",
+            "tolerance_fill": "#263f36",
+            "tolerance_edge": "#3a7657",
+            "current_band": "#3a3822",
+            "pitch": "#e5edf3",
+            "pitch_marker": "#ffffff",
+            "block_fill": "#d97706",
+            "block_outline": "#f59e0b",
+            "text": "#e5edf3",
+            "legend_bg": "#0f1720",
+            "invalid": "#2a333a",
+        }
 
     def _redraw_canvas(self) -> None:
         canvas = self.canvas
@@ -1248,6 +1553,10 @@ class PitchViewerApp(tk.Tk):
         with self.settings_lock:
             settings = AppSettings(**self.settings.__dict__)
 
+        visible_min_midi, visible_max_midi = self._effective_visible_range(settings)
+        palette = self._palette(settings)
+        canvas.configure(bg=palette["canvas_bg"])
+
         left_margin = 86
         right_margin = 28
         top_margin = 18
@@ -1261,75 +1570,95 @@ class PitchViewerApp(tk.Tk):
         if plot_right <= plot_left or plot_bottom <= plot_top:
             return
 
-        if settings.max_midi <= settings.min_midi:
+        if visible_max_midi <= visible_min_midi:
             return
 
         def midi_to_y(midi_value: float) -> float:
-            ratio = (midi_value - settings.min_midi) / (settings.max_midi - settings.min_midi)
+            ratio = (midi_value - visible_min_midi) / (visible_max_midi - visible_min_midi)
             return plot_bottom - ratio * (plot_bottom - plot_top)
+
+        canvas.create_rectangle(plot_left, plot_top, plot_right, plot_bottom, fill=palette["plot_bg"], outline="")
 
         self._draw_pitch_grid(
             canvas=canvas,
             settings=settings,
+            palette=palette,
             plot_left=plot_left,
             plot_right=plot_right,
             plot_top=plot_top,
             plot_bottom=plot_bottom,
             left_margin=left_margin,
+            visible_min_midi=visible_min_midi,
+            visible_max_midi=visible_max_midi,
             midi_to_y=midi_to_y,
         )
 
         self._draw_time_grid(
             canvas=canvas,
             settings=settings,
+            palette=palette,
             plot_left=plot_left,
             plot_right=plot_right,
             plot_top=plot_top,
             plot_bottom=plot_bottom,
         )
+
+        if settings.show_achieved_blocks:
+            self._draw_reached_note_blocks(
+                canvas=canvas,
+                settings=settings,
+                palette=palette,
+                plot_left=plot_left,
+                plot_right=plot_right,
+                plot_top=plot_top,
+                plot_bottom=plot_bottom,
+                visible_min_midi=visible_min_midi,
+                visible_max_midi=visible_max_midi,
+                midi_to_y=midi_to_y,
+            )
 
         self._draw_pitch_curve(
             canvas=canvas,
             settings=settings,
+            palette=palette,
             plot_left=plot_left,
             plot_right=plot_right,
             plot_top=plot_top,
             plot_bottom=plot_bottom,
+            visible_min_midi=visible_min_midi,
+            visible_max_midi=visible_max_midi,
             midi_to_y=midi_to_y,
         )
 
-        canvas.create_line(
-            plot_right,
-            plot_top,
-            plot_right,
-            plot_bottom,
-            fill="#d9e3ea",
-            width=1,
-        )
+        canvas.create_line(plot_right, plot_top, plot_right, plot_bottom, fill=palette["text"], width=1)
+        self._draw_legend(canvas, settings, palette, plot_left, plot_top)
 
     def _draw_pitch_grid(
         self,
         canvas: tk.Canvas,
         settings: AppSettings,
+        palette: dict[str, str],
         plot_left: int,
         plot_right: int,
         plot_top: int,
         plot_bottom: int,
         left_margin: int,
+        visible_min_midi: int,
+        visible_max_midi: int,
         midi_to_y: Callable[[float], float],
     ) -> None:
-        current_midi = None
+        current_match = None
         now = self._current_time_s()
         if self.current_point is not None and self.current_point.voiced:
             if now - self.current_point.time_s <= 0.75:
-                current_midi = int(round(self.current_point.midi_float))
+                current_match = self._matched_midi(self.current_point.midi_float, settings)
 
-        semitone_height = abs(midi_to_y(settings.min_midi + 1) - midi_to_y(settings.min_midi))
+        semitone_height = abs(midi_to_y(visible_min_midi + 1) - midi_to_y(visible_min_midi))
         label_every = 1 if semitone_height >= 13 else 2 if semitone_height >= 7 else 3
         scale_pcs = scale_pitch_classes(settings.scale_root, settings.scale_name)
         tolerance = settings.tolerance_cents / 100.0
 
-        for midi_value in range(settings.min_midi, settings.max_midi + 1):
+        for midi_value in range(visible_min_midi, visible_max_midi + 1):
             y_top = midi_to_y(midi_value + 0.5)
             y_bottom = midi_to_y(midi_value - 0.5)
             y1 = max(plot_top, min(plot_bottom, y_top))
@@ -1342,73 +1671,50 @@ class PitchViewerApp(tk.Tk):
             is_scale_note = pitch_class in scale_pcs
             is_natural = pitch_class in {0, 2, 4, 5, 7, 9, 11}
 
-            if midi_value == current_midi:
-                fill = "#3a3822"
-            elif is_scale_note:
-                fill = "#22313a" if is_natural else "#1d2a32"
+            if is_scale_note:
+                fill = palette["lane_natural"] if is_natural else palette["lane_accidental"]
             elif settings.show_out_of_scale:
-                fill = "#151d22"
+                fill = palette["lane_out"]
             else:
-                fill = "#11181d"
+                fill = palette["plot_bg"]
 
             canvas.create_rectangle(plot_left, y1, plot_right, y2, fill=fill, outline="")
 
             if is_scale_note and settings.show_tolerance_bands:
                 tolerance_top = midi_to_y(midi_value + tolerance)
                 tolerance_bottom = midi_to_y(midi_value - tolerance)
-                canvas.create_rectangle(
-                    plot_left,
-                    max(plot_top, min(plot_bottom, tolerance_top)),
-                    plot_right,
-                    max(plot_top, min(plot_bottom, tolerance_bottom)),
-                    fill="#263f36",
-                    outline="",
-                )
-                canvas.create_line(
-                    plot_left,
-                    max(plot_top, min(plot_bottom, tolerance_top)),
-                    plot_right,
-                    max(plot_top, min(plot_bottom, tolerance_top)),
-                    fill="#335747",
-                    width=1,
-                    dash=(2, 4),
-                )
-                canvas.create_line(
-                    plot_left,
-                    max(plot_top, min(plot_bottom, tolerance_bottom)),
-                    plot_right,
-                    max(plot_top, min(plot_bottom, tolerance_bottom)),
-                    fill="#335747",
-                    width=1,
-                    dash=(2, 4),
-                )
+                band_y1 = max(plot_top, min(plot_bottom, tolerance_top))
+                band_y2 = max(plot_top, min(plot_bottom, tolerance_bottom))
+                band_fill = palette["current_band"] if midi_value == current_match else palette["tolerance_fill"]
+                canvas.create_rectangle(plot_left, band_y1, plot_right, band_y2, fill=band_fill, outline="")
+                canvas.create_line(plot_left, band_y1, plot_right, band_y1, fill=palette["tolerance_edge"], width=1, dash=(2, 4))
+                canvas.create_line(plot_left, band_y2, plot_right, band_y2, fill=palette["tolerance_edge"], width=1, dash=(2, 4))
 
-            label_fill = "#dfe7ee" if is_scale_note else "#87929b"
+            label_fill = palette["label_bg"] if is_scale_note else palette["label_dim_bg"]
             if not settings.show_out_of_scale and not is_scale_note:
-                label_fill = "#53606a"
+                label_fill = palette["label_dim_bg"]
 
-            canvas.create_rectangle(
-                0,
-                y1,
-                left_margin,
-                y2,
-                fill=label_fill,
-                outline="#1e2930",
-            )
+            canvas.create_rectangle(0, y1, left_margin, y2, fill=label_fill, outline="#1e2930")
 
             center_y = midi_to_y(midi_value)
-            center_line = "#52616b" if is_scale_note else "#2a333a"
             if settings.show_center_lines or is_scale_note:
                 width = 2 if is_scale_note and settings.show_center_lines else 1
-                canvas.create_line(plot_left, center_y, plot_right, center_y, fill=center_line, width=width)
+                canvas.create_line(plot_left, center_y, plot_right, center_y, fill=palette["center"], width=width)
 
-            should_label = (midi_value - settings.min_midi) % label_every == 0
+            # Marcas de separación de zona inválida: los espacios entre bandas de tolerancia quedan oscuros.
+            if is_scale_note and settings.show_tolerance_bands and settings.tolerance_cents < 49:
+                upper_invalid = midi_to_y(midi_value + 0.5)
+                lower_invalid = midi_to_y(midi_value - 0.5)
+                canvas.create_line(plot_left, upper_invalid, plot_right, upper_invalid, fill=palette["invalid"], width=1)
+                canvas.create_line(plot_left, lower_invalid, plot_right, lower_invalid, fill=palette["invalid"], width=1)
+
+            should_label = (midi_value - visible_min_midi) % label_every == 0
             if should_label and (settings.show_out_of_scale or is_scale_note):
                 canvas.create_text(
                     left_margin - 8,
                     center_y,
                     text=midi_to_note_name(midi_value, settings.note_language),
-                    fill="#111820",
+                    fill=palette["label_fg"],
                     font=("TkDefaultFont", 9),
                     anchor="e",
                 )
@@ -1417,12 +1723,13 @@ class PitchViewerApp(tk.Tk):
         self,
         canvas: tk.Canvas,
         settings: AppSettings,
+        palette: dict[str, str],
         plot_left: int,
         plot_right: int,
         plot_top: int,
         plot_bottom: int,
     ) -> None:
-        now = self._current_time_s()
+        now = self._display_time_s()
         window_s = float(settings.time_window_s)
         visible_start = now - window_s
 
@@ -1441,36 +1748,140 @@ class PitchViewerApp(tk.Tk):
             x = plot_left + ratio * (plot_right - plot_left)
 
             if plot_left <= x <= plot_right:
-                canvas.create_line(x, plot_top, x, plot_bottom, fill="#25323a", width=1)
+                canvas.create_line(x, plot_top, x, plot_bottom, fill=palette["time_grid"], width=1)
                 seconds_ago = now - tick
                 canvas.create_text(
                     x,
                     plot_bottom + 16,
                     text=f"-{seconds_ago:0.0f}s",
-                    fill="#9aa7b0",
+                    fill=palette["center"],
                     font=("TkDefaultFont", 8),
                     anchor="n",
                 )
 
             tick += step
 
-    def _draw_pitch_curve(
+    def _draw_reached_note_blocks(
         self,
         canvas: tk.Canvas,
         settings: AppSettings,
+        palette: dict[str, str],
         plot_left: int,
         plot_right: int,
         plot_top: int,
         plot_bottom: int,
+        visible_min_midi: int,
+        visible_max_midi: int,
         midi_to_y: Callable[[float], float],
     ) -> None:
-        now = self._current_time_s()
+        now = self._display_time_s()
+        window_s = float(settings.time_window_s)
+        visible_start = now - window_s
+        plot_width = plot_right - plot_left
+        tolerance = settings.tolerance_cents / 100.0
+
+        active_midi: Optional[int] = None
+        start_t: Optional[float] = None
+        last_t: Optional[float] = None
+
+        def flush_segment() -> None:
+            nonlocal active_midi, start_t, last_t
+            if active_midi is None or start_t is None or last_t is None:
+                return
+            if last_t < visible_start or start_t > now:
+                active_midi = None
+                start_t = None
+                last_t = None
+                return
+            if last_t - start_t < 0.035:
+                active_midi = None
+                start_t = None
+                last_t = None
+                return
+
+            x1 = plot_left + ((max(start_t, visible_start) - visible_start) / window_s) * plot_width
+            x2 = plot_left + ((min(last_t, now) - visible_start) / window_s) * plot_width
+            if x2 - x1 < 2.0:
+                x2 = x1 + 2.0
+
+            y1 = max(plot_top, min(plot_bottom, midi_to_y(active_midi + tolerance)))
+            y2 = max(plot_top, min(plot_bottom, midi_to_y(active_midi - tolerance)))
+
+            canvas.create_rectangle(
+                x1,
+                y1,
+                x2,
+                y2,
+                fill=palette["block_fill"],
+                outline=palette["block_outline"],
+                width=1,
+                stipple="gray50",
+            )
+
+            if x2 - x1 >= 34:
+                canvas.create_text(
+                    (x1 + x2) / 2.0,
+                    (y1 + y2) / 2.0,
+                    text=midi_to_note_name(active_midi, settings.note_language),
+                    fill=palette["text"],
+                    font=("TkDefaultFont", 8, "bold"),
+                    anchor="center",
+                )
+
+            active_midi = None
+            start_t = None
+            last_t = None
+
+        for point in self.points:
+            if point.time_s < visible_start - 0.30:
+                continue
+            if point.time_s > now:
+                break
+
+            matched = self._matched_midi(point.midi_float, settings) if point.voiced else None
+            if matched is not None and not (visible_min_midi <= matched <= visible_max_midi):
+                matched = None
+
+            if matched is None:
+                flush_segment()
+                continue
+
+            if active_midi is None:
+                active_midi = matched
+                start_t = point.time_s
+                last_t = point.time_s
+                continue
+
+            if matched == active_midi and last_t is not None and point.time_s - last_t <= 0.25:
+                last_t = point.time_s
+                continue
+
+            flush_segment()
+            active_midi = matched
+            start_t = point.time_s
+            last_t = point.time_s
+
+        flush_segment()
+
+    def _draw_pitch_curve(
+        self,
+        canvas: tk.Canvas,
+        settings: AppSettings,
+        palette: dict[str, str],
+        plot_left: int,
+        plot_right: int,
+        plot_top: int,
+        plot_bottom: int,
+        visible_min_midi: int,
+        visible_max_midi: int,
+        midi_to_y: Callable[[float], float],
+    ) -> None:
+        now = self._display_time_s()
         window_s = float(settings.time_window_s)
         visible_start = now - window_s
         plot_width = plot_right - plot_left
 
         previous: Optional[tuple[PitchPoint, float, float]] = None
-        scale_pcs = scale_pitch_classes(settings.scale_root, settings.scale_name)
 
         for point in self.points:
             if point.time_s < visible_start or point.time_s > now:
@@ -1479,7 +1890,7 @@ class PitchViewerApp(tk.Tk):
             valid = (
                 point.voiced
                 and not math.isnan(point.midi_float)
-                and settings.min_midi - 0.5 <= point.midi_float <= settings.max_midi + 0.5
+                and visible_min_midi - 0.5 <= point.midi_float <= visible_max_midi + 0.5
             )
 
             if not valid:
@@ -1496,70 +1907,110 @@ class PitchViewerApp(tk.Tk):
                 jump_ok = abs(point.midi_float - previous_point.midi_float) <= 12.0
 
                 if gap_ok and jump_ok:
-                    color = self._curve_color(point, settings, scale_pcs)
                     canvas.create_line(
                         px,
                         py,
                         x,
                         y,
-                        fill=color,
-                        width=3,
+                        fill=palette["pitch"],
+                        width=settings.pitch_line_width,
                         capstyle=tk.ROUND,
                         joinstyle=tk.ROUND,
                     )
 
             previous = (point, x, y)
 
-        if self.current_point is not None and self.current_point.voiced:
-            if now - self.current_point.time_s <= 0.75:
+        if not self.visual_paused and self.current_point is not None and self.current_point.voiced:
+            if self._current_time_s() - self.current_point.time_s <= 0.75:
                 midi_value = self.current_point.midi_float
-                if settings.min_midi - 0.5 <= midi_value <= settings.max_midi + 0.5:
+                if visible_min_midi - 0.5 <= midi_value <= visible_max_midi + 0.5:
                     y = midi_to_y(midi_value)
-                    color = self._curve_color(self.current_point, settings, scale_pcs)
                     canvas.create_oval(
-                        plot_right - 6,
-                        y - 6,
-                        plot_right + 6,
-                        y + 6,
-                        fill="#ffffff",
-                        outline=color,
+                        plot_right - 5,
+                        y - 5,
+                        plot_right + 5,
+                        y + 5,
+                        fill=palette["pitch_marker"],
+                        outline=palette["pitch"],
                         width=2,
                     )
                     nearest = int(round(midi_value))
                     note_text = midi_to_note_name(nearest, settings.note_language)
                     cents = cents_from_nearest_note(midi_value)
-                    label = f"{note_text} {cents:+.0f}c"
+                    matched = self._matched_midi(midi_value, settings)
+                    prefix = "✓" if matched is not None else "—"
+                    label = f"{prefix} {note_text} {cents:+.0f}c"
                     canvas.create_rectangle(
-                        plot_right - 88,
+                        plot_right - 102,
                         y - 14,
                         plot_right - 10,
                         y + 14,
-                        fill="#0f1720",
-                        outline=color,
+                        fill=palette["legend_bg"],
+                        outline=palette["pitch"],
                         width=1,
                     )
                     canvas.create_text(
-                        plot_right - 49,
+                        plot_right - 56,
                         y,
                         text=label,
-                        fill="#e5edf3",
+                        fill=palette["text"],
                         font=("TkDefaultFont", 9, "bold"),
                         anchor="center",
                     )
 
+    def _draw_legend(
+        self,
+        canvas: tk.Canvas,
+        settings: AppSettings,
+        palette: dict[str, str],
+        plot_left: int,
+        plot_top: int,
+    ) -> None:
+        lines = [
+            f"Línea pitch: grosor {settings.pitch_line_width}",
+            f"Banda válida: ±{settings.tolerance_cents} cents",
+            "Bloque: nota alcanzada",
+            "Zona oscura: entre notas / desafinado",
+        ]
+        if settings.dynamic_tracking:
+            lines.append("Seguimiento dinámico activo")
+        if self.visual_paused:
+            lines.append("Vista pausada")
+
+        x1 = plot_left + 10
+        y1 = plot_top + 8
+        x2 = x1 + 245
+        y2 = y1 + 18 * len(lines) + 10
+        canvas.create_rectangle(x1, y1, x2, y2, fill=palette["legend_bg"], outline=palette["center"], width=1)
+
+        y = y1 + 13
+        for idx, text in enumerate(lines):
+            if idx == 0:
+                canvas.create_line(x1 + 10, y, x1 + 34, y, fill=palette["pitch"], width=settings.pitch_line_width)
+                tx = x1 + 42
+            elif idx == 1:
+                canvas.create_rectangle(x1 + 10, y - 5, x1 + 34, y + 5, fill=palette["tolerance_fill"], outline=palette["tolerance_edge"])
+                tx = x1 + 42
+            elif idx == 2:
+                canvas.create_rectangle(x1 + 10, y - 5, x1 + 34, y + 5, fill=palette["block_fill"], outline=palette["block_outline"], stipple="gray50")
+                tx = x1 + 42
+            else:
+                tx = x1 + 10
+            canvas.create_text(tx, y, text=text, fill=palette["text"], font=("TkDefaultFont", 8), anchor="w")
+            y += 18
+
     @staticmethod
-    def _curve_color(point: PitchPoint, settings: AppSettings, scale_pcs: set[int]) -> str:
-        nearest_midi = int(round(point.midi_float))
-        cents = abs(cents_from_nearest_note(point.midi_float))
-        in_scale = nearest_midi % 12 in scale_pcs
-
-        if not in_scale:
-            return "#ef4444"
-
-        if cents <= settings.tolerance_cents:
-            return "#22c55e"
-
-        return "#f59e0b"
+    def _matched_midi(midi_float: float, settings: AppSettings) -> Optional[int]:
+        if math.isnan(midi_float):
+            return None
+        nearest_midi = int(round(midi_float))
+        cents = abs(cents_from_nearest_note(midi_float))
+        if cents > settings.tolerance_cents:
+            return None
+        scale_pcs = scale_pitch_classes(settings.scale_root, settings.scale_name)
+        if nearest_midi % 12 not in scale_pcs:
+            return None
+        return nearest_midi
 
     def _show_about(self) -> None:
         messagebox.showinfo(

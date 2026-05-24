@@ -51,6 +51,10 @@ class AppSettings:
     show_out_of_scale: bool = True
     show_tolerance_bands: bool = True
     show_center_lines: bool = True
+    show_achieved_blocks: bool = True
+    dynamic_tracking: bool = False
+    pitch_line_width: int = 2
+    theme_name: str = "dark"
     confidence_threshold: float = 0.35
     rms_threshold: float = 0.006
     smoothing_factor: float = 0.35
@@ -195,11 +199,16 @@ def normalize_settings(settings: AppSettings) -> AppSettings:
         settings.scale_name = "chromatic"
 
     settings.scale_root = _coerce_int(settings.scale_root, 0) % 12
-    settings.tolerance_cents = _clamp_int(settings.tolerance_cents, 1, 99, 30)
+    settings.tolerance_cents = _clamp_int(settings.tolerance_cents, 1, 49, 30)
 
     settings.show_out_of_scale = bool(settings.show_out_of_scale)
     settings.show_tolerance_bands = bool(settings.show_tolerance_bands)
     settings.show_center_lines = bool(settings.show_center_lines)
+    settings.show_achieved_blocks = bool(settings.show_achieved_blocks)
+    settings.dynamic_tracking = bool(settings.dynamic_tracking)
+    settings.pitch_line_width = _clamp_int(settings.pitch_line_width, 1, 8, 2)
+    if settings.theme_name not in {"dark", "light"}:
+        settings.theme_name = "dark"
 
     settings.confidence_threshold = _clamp_float(settings.confidence_threshold, 0.0, 1.0, 0.35)
     settings.rms_threshold = _clamp_float(settings.rms_threshold, 0.0, 1.0, 0.006)

@@ -1,70 +1,58 @@
-# PitchViewer - Etapa 6
+# Pitch Viewer - Etapa 7
 
-Monitor de afinación vocal de escritorio con Tkinter.
-
-Esta etapa agrega una arquitectura de backends de detección de pitch. La app mantiene el backend portable de autocorrelación FFT y agrega un segundo backend portable tipo YIN/CMND. También deja preparados backends opcionales de Torchcrepe.
+Aplicación Tkinter para seguimiento visual de pitch vocal en tiempo real.
 
 ## Ejecutar
 
 Desde la carpeta `PitchViewer`:
 
 ```bash
-python -m venv .venv
-.venv\Scripts\activate
 pip install -r requirements.txt
 python .\main.py
 ```
 
-También puede ejecutarse desde la carpeta padre:
+También funciona como módulo si se ejecuta desde la carpeta padre:
 
 ```bash
 python -m PitchViewer.main
 ```
 
-## Dependencias base
+## Cambios de la etapa 7
 
-```txt
-numpy>=1.24
-sounddevice>=0.4.6
-```
+- Rangos vocales extendidos en `Vista > Rango visible`:
+  - Bajo ±½ octava.
+  - Barítono ±½ octava.
+  - Tenor ±½ octava.
+  - Contralto ±½ octava.
+  - Mezzo ±½ octava.
+  - Soprano ±½ octava.
+- Seguimiento dinámico de voz:
+  - `Vista > Seguimiento dinámico de voz`.
+  - Desplaza visualmente la ventana de notas para mantener la voz cerca del centro.
+- Bloques de nota alcanzada:
+  - `Vista > Mostrar bloques alcanzados`.
+  - Los bloques aparecen solo cuando el pitch está dentro de la tolerancia en cents y dentro de la escala activa.
+  - Esto deja preparadas las capas gráficas para karaoke: target vs. nota efectivamente alcanzada.
+- Línea de pitch con color único.
+- Grosor de línea ajustable:
+  - `Vista > Grosor de línea de pitch...`.
+- Zonas inválidas más explícitas:
+  - La región válida de una nota es la banda de tolerancia.
+  - Fuera de esa banda, la voz aparece como desafinada aunque esté cerca de una nota.
+  - La tolerancia máxima se limita a 49 cents para evitar que las bandas de notas contiguas se toquen.
+- Pausa visual sin detener audio:
+  - Botón `Pausar vista` o `Vista > Pausar/reanudar visualización`.
+- Zoom vertical con rueda del mouse.
+- Arrastre vertical del rango con botón medio o botón derecho.
+- Leyenda visual sobre el canvas.
+- Modo claro/oscuro básico.
 
-## Backends incluidos
+## Backends
 
-- **Autocorrelación FFT**: backend por defecto, portable y rápido.
-- **YIN CMND**: backend portable con NumPy, más conservador para voz monofónica sostenida.
-- **Torchcrepe tiny/full**: backends opcionales. Requieren instalar `torch` y `torchcrepe`; no vienen en `requirements.txt` para no romper entornos Windows con Python reciente.
+La etapa 7 conserva los backends de la etapa 6:
 
-Para intentar Torchcrepe:
+- Autocorrelación FFT.
+- YIN CMND.
+- Torchcrepe tiny/full como opción experimental, si se instalan dependencias opcionales.
 
-```bash
-pip install -r optional-requirements-torchcrepe.txt
-```
-
-Luego selecciona el backend desde:
-
-```text
-Audio > Backend de detección
-```
-
-## Configuración persistente
-
-La selección de backend queda guardada en `settings.json` junto con el resto de configuración.
-
-En Windows:
-
-```text
-%APPDATA%\PitchViewer\settings.json
-```
-
-## Nota práctica
-
-Para canto en tiempo real, prueba primero estos dos backends:
-
-1. Autocorrelación FFT.
-2. YIN CMND.
-
-Si YIN produce menos saltos pero responde más lento, ajusta los controles de estabilidad desde:
-
-```text
-Audio > Estabilidad de pitch...
-```
+Torchcrepe sigue siendo opcional y puede fallar según versión de Python, PyTorch y Windows. Se deja para una instancia separada de reparación.
