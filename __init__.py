@@ -1,0 +1,5 @@
+# -*- coding: utf-8 -*-
+
+"""PitchViewer."""
+
+__version__ = "0.8.0"

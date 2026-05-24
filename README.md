@@ -1,48 +1,57 @@
-# Pitch Viewer v0.7.1
+# PitchViewer v0.8.1
 
-Aplicación de escritorio en Tkinter para monitoreo de afinación vocal.
+Monitor de afinación vocal de escritorio en Python/Tkinter.
+
+Esta versión corrige el diseño de backends offline: `Record` ya no fuerza siempre `Torchcrepe full`. Ahora hay dos preferencias separadas:
+
+- `Backend en vivo`: usado por `▶ Play`.
+- `Backend offline / record`: usado por `⏺ Record` + `⏹ Stop`.
 
 ## Ejecución
 
 ```bash
-cd "E:\\Felpipe\\Proyectos propios\\PitchViewer"
+cd "E:\Felpipe\Proyectos propios\PitchViewer"
 pip install -r requirements.txt
 python .\main.py
 ```
 
-## Dependencias base
-
-```txt
-numpy
-sounddevice
-```
-
-## Dependencias opcionales para Torchcrepe
+Para activar Torchcrepe:
 
 ```bash
 pip install -r optional-requirements-torchcrepe.txt
 ```
 
-## Cambios de v0.7.1
+## Cambios v0.8.1
 
-- Se mantiene la etapa 7 visual: rangos vocales, seguimiento dinámico, bloques de nota alcanzada, grosor configurable de línea, zonas válidas por tolerancia y modo claro/oscuro.
-- Se agrega transporte visual con botones:
-  - `▶` inicia o reanuda captura en vivo.
-  - `⏸` pausa la captura sin borrar el historial visual.
-  - `⏹` detiene la captura.
-  - `⏺` graba en memoria para análisis offline.
-  - `⏪` / `⏩` navegan media ventana en una grabación offline; en modo online ajustan la ventana temporal +1s / -1s.
-  - `⏮` / `⏭` saltan al inicio/final de una grabación offline.
-- La grabación offline se limita a la ventana temporal configurada, con máximo configurable hasta 60s mediante los botones `⏪`/`⏩`.
-- Al detener una grabación iniciada con `⏺`, se analiza el audio en memoria con Torchcrepe full.
-- Si no se detecta CUDA, Torchcrepe full queda deshabilitado como backend en vivo, pero sigue disponible para análisis offline.
+- Menú `Audio > Backend en vivo`.
+- Menú `Audio > Backend offline / record`.
+- `Torchcrepe full` sigue deshabilitado como backend vivo si no hay CUDA.
+- `Torchcrepe full` sigue disponible como backend offline aunque no haya CUDA.
+- El modo offline puede usar libremente:
+  - Autocorrelación FFT;
+  - YIN CMND;
+  - Torchcrepe tiny;
+  - Torchcrepe full.
+- La selección offline se guarda en `settings.json` como `offline_detector_backend`.
+- `⏺ Record` + `⏹ Stop` usa el backend offline seleccionado, no el backend vivo.
 
-## Notas sobre Torchcrepe full
+## Transporte
 
-Torchcrepe full puede funcionar correctamente en CPU para análisis offline, pero no suele alcanzar tiempo real. En equipos sin CUDA se recomienda usar en vivo:
+- `▶`: inicia o reanuda captura viva con `Backend en vivo`.
+- `⏸`: pausa sin borrar historial.
+- `⏹`: detiene captura; si venías de `⏺`, lanza análisis offline.
+- `⏺`: graba en memoria dentro de la ventana temporal vigente.
+- `⏪` / `⏩`:
+  - offline: retrocede/avanza media ventana;
+  - online: aumenta/reduce la ventana temporal en 1 segundo.
+- `⏮` / `⏭`:
+  - offline: inicio/final de la grabación.
 
-- YIN CMND
-- Autocorrelación FFT
-- Torchcrepe tiny, si responde suficientemente rápido
+## Regla de diseño
 
-Torchcrepe full queda reservado para análisis offline y, más adelante, para producción de archivos karaoke.
+`Play` y `Record` no significan “usar el mismo backend en dos modos”. Son flujos distintos:
+
+- `▶ Play` usa `backend_live`.
+- `⏺ Record` + `⏹ Stop` usa `backend_offline`.
+
+Esto deja preparada la transición a karaoke: juego en tiempo real con backend vivo, producción/análisis con backend offline.

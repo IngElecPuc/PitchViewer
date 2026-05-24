@@ -62,6 +62,7 @@ class AppSettings:
     max_jump_semitones: float = 7.0
     octave_guard: bool = True
     detector_backend: str = DEFAULT_BACKEND_ID
+    offline_detector_backend: str = "torchcrepe_full"
     selected_input_device_index: Optional[int] = None
     selected_input_device_name: str = ""
     window_geometry: str = "1120x780"
@@ -221,6 +222,7 @@ def normalize_settings(settings: AppSettings) -> AppSettings:
     settings.max_jump_semitones = _clamp_float(settings.max_jump_semitones, 1.0, 24.0, 7.0)
     settings.octave_guard = bool(settings.octave_guard)
     settings.detector_backend = normalize_backend_id(settings.detector_backend)
+    settings.offline_detector_backend = normalize_backend_id(settings.offline_detector_backend)
 
     if settings.selected_input_device_index is not None:
         settings.selected_input_device_index = _coerce_optional_device_index(settings.selected_input_device_index)
