@@ -524,12 +524,15 @@ class PitchViewerApp(tk.Tk):
         ttk.Label(settings_row, textvariable=self.settings_status_var).pack(side=tk.LEFT, padx=(0, 18))
         ttk.Label(settings_row, textvariable=self.config_status_var).pack(side=tk.RIGHT, padx=(0, 0))
 
+        self.main_view = ttk.Frame(root)
+        self.main_view.pack(fill=tk.BOTH, expand=True)
+
         self.canvas = tk.Canvas(
-            root,
+            self.main_view,
             bg="#172026",
             highlightthickness=0,
         )
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
         self.canvas.bind("<MouseWheel>", self._on_canvas_mousewheel)
         self.canvas.bind("<Button-4>", lambda event: self._on_canvas_wheel_linux(event, 1))
         self.canvas.bind("<Button-5>", lambda event: self._on_canvas_wheel_linux(event, -1))
@@ -542,15 +545,15 @@ class PitchViewerApp(tk.Tk):
 
         self._build_karaoke_panel(root)
 
-        footer = ttk.Label(
+        self.footer = ttk.Label(
             root,
             text=(
-                "v0.9.0: karaoke producción (.pvk), análisis offline de pista vocal y letras. "
-                "Usa audífonos para evitar que el micrófono capture los parlantes."
+                "v0.9.1: karaoke producción (.pvk), análisis offline de pista vocal y letras. "
+                "La letra se despliega al lado derecho al activar Karaoke."
             ),
             anchor="w",
         )
-        footer.pack(fill=tk.X, side=tk.BOTTOM, pady=(6, 0))
+        self.footer.pack(fill=tk.X, side=tk.BOTTOM, pady=(6, 0))
 
     def _make_transport_button(self, parent: tk.Widget, symbol: str, command, tooltip: str = "") -> tk.Button:
         """Crea botones de transporte con glifos en modo texto, sin recuadro interno tipo emoji."""
@@ -2931,23 +2934,43 @@ class PitchViewerApp(tk.Tk):
         ttk.Button(timeline, text="⏩", width=4, command=self._transport_forward).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(timeline, text="⏭", width=4, command=self._jump_karaoke_end).pack(side=tk.LEFT)
 
-        ttk.Label(self.karaoke_panel, textvariable=self.karaoke_current_lyric_var, anchor="center").pack(fill=tk.X, pady=(2, 4))
+        self.karaoke_lyrics_panel = ttk.LabelFrame(self.main_view, text="Letra", padding=8)
+        ttk.Label(
+            self.karaoke_lyrics_panel,
+            textvariable=self.karaoke_current_lyric_var,
+            anchor="center",
+            wraplength=300,
+        ).pack(fill=tk.X, pady=(0, 6))
 
-        self.karaoke_lyrics_text = tk.Text(self.karaoke_panel, height=5, wrap=tk.WORD)
-        self.karaoke_lyrics_text.pack(fill=tk.BOTH, expand=False)
+        self.karaoke_lyrics_text = tk.Text(
+            self.karaoke_lyrics_panel,
+            width=34,
+            height=18,
+            wrap=tk.WORD,
+        )
+        self.karaoke_lyrics_text.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        lyrics_scrollbar = ttk.Scrollbar(
+            self.karaoke_lyrics_panel,
+            orient=tk.VERTICAL,
+            command=self.karaoke_lyrics_text.yview,
+        )
+        lyrics_scrollbar.pack(fill=tk.Y, side=tk.RIGHT)
+        self.karaoke_lyrics_text.configure(yscrollcommand=lyrics_scrollbar.set)
         self.karaoke_lyrics_text.insert("1.0", "Carga una pista vocal y, opcionalmente, una letra .txt o .lrc.")
         self.karaoke_lyrics_text.configure(state=tk.DISABLED)
 
     def _toggle_karaoke_panel(self) -> None:
         if self.karaoke_panel_visible:
             self.karaoke_panel.pack_forget()
+            self.karaoke_lyrics_panel.pack_forget()
             self.karaoke_panel_visible = False
             return
         self._show_karaoke_panel()
 
     def _show_karaoke_panel(self) -> None:
         if not self.karaoke_panel_visible:
-            self.karaoke_panel.pack(fill=tk.X, side=tk.BOTTOM, before=self.canvas, pady=(8, 0))
+            self.karaoke_panel.pack(fill=tk.X, side=tk.BOTTOM, before=self.footer, pady=(8, 0))
+            self.karaoke_lyrics_panel.pack(fill=tk.Y, side=tk.RIGHT, padx=(8, 0))
             self.karaoke_panel_visible = True
 
     def _format_time(self, seconds: float) -> str:

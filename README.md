@@ -1,4 +1,4 @@
-# Pitch Viewer v0.9.0
+# Pitch Viewer v0.9.1
 
 Monitor de afinación vocal en escritorio con Tkinter.
 
@@ -17,7 +17,7 @@ pip install -r optional-requirements-torchcrepe.txt
 
 ## Karaoke producción
 
-La etapa 9 agrega creación de proyectos karaoke `.pvk`.
+La v0.9.1 mantiene la creación de proyectos karaoke `.pvk` y mueve el panel de letras al costado derecho. Los controles de producción y la línea de tiempo quedan en la franja inferior.
 
 Flujo básico:
 
