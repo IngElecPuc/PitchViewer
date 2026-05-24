@@ -41,7 +41,13 @@ from .constants import (
     TIME_WINDOWS,
     TOLERANCE_OPTIONS,
 )
-from .detection.autocorrelation import estimate_pitch_autocorrelation
+from .detection.registry import (
+    BACKENDS,
+    BACKEND_AUTOCORRELATION,
+    backend_label,
+    create_pitch_detector,
+    normalize_backend_id,
+)
 from .models import InputDevice, PitchPoint
 from .music.notes import (
     LANGUAGE_LABELS,
@@ -70,7 +76,7 @@ class PitchViewerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
 
-        self.title("Monitor de afinación vocal - Etapa 5")
+        self.title("Monitor de afinación vocal - Etapa 6")
 
         self.settings_load_result = load_settings()
         self.settings = self.settings_load_result.settings
@@ -92,6 +98,8 @@ class PitchViewerApp(tk.Tk):
         self.sample_rate = 44100
         self.block_size = 512
         self.frame_size = 4096
+        self.pitch_detector = None
+        self.active_backend_id = normalize_backend_id(self.settings.detector_backend)
 
         self.time_origin = time.perf_counter()
         self.points: deque[PitchPoint] = deque(maxlen=20000)
@@ -111,6 +119,7 @@ class PitchViewerApp(tk.Tk):
         self.show_out_of_scale_var = tk.BooleanVar(value=self.settings.show_out_of_scale)
         self.show_tolerance_bands_var = tk.BooleanVar(value=self.settings.show_tolerance_bands)
         self.show_center_lines_var = tk.BooleanVar(value=self.settings.show_center_lines)
+        self.detector_backend_var = tk.StringVar(value=normalize_backend_id(self.settings.detector_backend))
 
         self.note_status_var = tk.StringVar(value="Nota: —")
         self.freq_status_var = tk.StringVar(value="Frecuencia: —")
@@ -120,6 +129,7 @@ class PitchViewerApp(tk.Tk):
         self.scale_status_var = tk.StringVar(value="Escala: cromática")
         self.range_status_var = tk.StringVar(value="Rango: —")
         self.audio_status_var = tk.StringVar(value="Audio: detenido")
+        self.backend_status_var = tk.StringVar(value="Backend: —")
         self.device_status_var = tk.StringVar(value="Entrada: —")
         self.settings_status_var = tk.StringVar(value="")
         self.config_status_var = tk.StringVar(value="")
@@ -154,6 +164,18 @@ class PitchViewerApp(tk.Tk):
         audio_menu.add_separator()
         audio_menu.add_command(label="Fuente de entrada...", command=self._choose_input_device)
         audio_menu.add_command(label="Actualizar dispositivos", command=lambda: self._load_audio_devices(select_default=False))
+        audio_menu.add_separator()
+
+        backend_menu = tk.Menu(audio_menu, tearoff=False)
+        for backend in BACKENDS:
+            suffix = " (opcional)" if backend.is_optional else ""
+            backend_menu.add_radiobutton(
+                label=f"{backend.label}{suffix}",
+                variable=self.detector_backend_var,
+                value=backend.backend_id,
+                command=lambda value=backend.backend_id: self._set_detector_backend(value),
+            )
+        audio_menu.add_cascade(label="Backend de detección", menu=backend_menu)
         audio_menu.add_separator()
         audio_menu.add_command(label="Parámetros de detección...", command=self._open_detector_settings)
         audio_menu.add_command(label="Estabilidad de pitch...", command=self._open_stability_settings)
@@ -288,6 +310,7 @@ class PitchViewerApp(tk.Tk):
         ttk.Button(toolbar, text="Fuente...", command=self._choose_input_device).pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Label(toolbar, textvariable=self.device_status_var).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Label(toolbar, textvariable=self.backend_status_var).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Label(toolbar, textvariable=self.audio_status_var).pack(side=tk.RIGHT)
 
         status = ttk.Frame(root)
@@ -317,7 +340,7 @@ class PitchViewerApp(tk.Tk):
         footer = ttk.Label(
             root,
             text=(
-                "Etapa 5: configuración persistente en settings.json; mantiene estabilización, tolerancia, evaluación de afinación y exportación CSV. "
+                "Etapa 6: backends seleccionables de pitch; mantiene persistencia, estabilización, tolerancia y exportación CSV. "
                 "Usa audífonos para evitar que el micrófono capture los parlantes."
             ),
             anchor="w",
@@ -467,6 +490,7 @@ class PitchViewerApp(tk.Tk):
         self.show_out_of_scale_var.set(settings.show_out_of_scale)
         self.show_tolerance_bands_var.set(settings.show_tolerance_bands)
         self.show_center_lines_var.set(settings.show_center_lines)
+        self.detector_backend_var.set(normalize_backend_id(settings.detector_backend))
 
         try:
             self.geometry(settings.window_geometry)
@@ -623,6 +647,21 @@ class PitchViewerApp(tk.Tk):
 
         self.audio_queue = queue.Queue(maxsize=30)
         self.pitch_queue = queue.Queue(maxsize=300)
+
+        try:
+            self.pitch_detector = self._create_active_pitch_detector()
+        except Exception as exc:
+            self.pitch_detector = None
+            self.audio_status_var.set("Audio: detenido")
+            messagebox.showerror(
+                "Backend de detección",
+                f"No se pudo iniciar el backend seleccionado:\n\n{backend_label(self.settings.detector_backend)}\n\n{exc}\n\n"
+                "Se volverá a Autocorrelación FFT.",
+                parent=self,
+            )
+            self._set_detector_backend(BACKEND_AUTOCORRELATION, autosave=True, restart_if_running=False)
+            return
+
         self.stop_event.clear()
         self.points.clear()
         self.current_point = None
@@ -671,6 +710,7 @@ class PitchViewerApp(tk.Tk):
             self.stream = None
 
         self.audio_status_var.set("Audio: detenido")
+        self.pitch_detector = None
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
         if indata is None or len(indata) == 0:
@@ -715,12 +755,13 @@ class PitchViewerApp(tk.Tk):
 
             frame = rolling.copy()
             rms = float(np.sqrt(np.mean(frame * frame)))
-            freq_hz, confidence = estimate_pitch_autocorrelation(
-                frame,
-                self.sample_rate,
-                detect_min_hz,
-                detect_max_hz,
-            )
+            detector = self.pitch_detector
+            if detector is None:
+                continue
+
+            estimate = detector.estimate(frame, detect_min_hz, detect_max_hz)
+            freq_hz = float(estimate.freq_hz)
+            confidence = float(estimate.confidence)
 
             voiced = (
                 detect_min_hz <= freq_hz <= detect_max_hz
@@ -785,6 +826,45 @@ class PitchViewerApp(tk.Tk):
                     self.pitch_queue.put_nowait(point)
                 except queue.Full:
                     pass
+
+    def _create_active_pitch_detector(self):
+        with self.settings_lock:
+            backend_id = normalize_backend_id(self.settings.detector_backend)
+
+        detector = create_pitch_detector(
+            backend_id=backend_id,
+            sample_rate=self.sample_rate,
+            frame_size=self.frame_size,
+        )
+        self.active_backend_id = normalize_backend_id(backend_id)
+        self.backend_status_var.set(f"Backend: {backend_label(self.active_backend_id)}")
+        return detector
+
+    def _set_detector_backend(
+        self,
+        backend_id: str,
+        autosave: bool = True,
+        restart_if_running: bool = True,
+    ) -> None:
+        backend_id = normalize_backend_id(backend_id)
+        was_running = self.is_running and restart_if_running
+
+        if was_running:
+            self.stop_audio()
+
+        with self.settings_lock:
+            self.settings.detector_backend = backend_id
+
+        self.detector_backend_var.set(backend_id)
+        self.active_backend_id = backend_id
+        self.backend_status_var.set(f"Backend: {backend_label(backend_id)}")
+        self._refresh_status_labels()
+
+        if autosave:
+            self._autosave_settings()
+
+        if was_running:
+            self.start_audio()
 
     @staticmethod
     def _correct_octave_jump(midi_raw: float, previous_midi: float) -> float:
@@ -1109,8 +1189,10 @@ class PitchViewerApp(tk.Tk):
         )
         self.settings_status_var.set(
             f"A4: {settings.a4_hz:.1f} Hz | Ventana: {settings.time_window_s}s | "
-            f"Tolerancia: ±{settings.tolerance_cents} cents | Mediana: {settings.median_window}"
+            f"Tolerancia: ±{settings.tolerance_cents} cents | Mediana: {settings.median_window} | "
+            f"Backend: {backend_label(settings.detector_backend)}"
         )
+        self.backend_status_var.set(f"Backend: {backend_label(settings.detector_backend)}")
 
     def _update_status(self) -> None:
         now = self._current_time_s()
@@ -1482,11 +1564,10 @@ class PitchViewerApp(tk.Tk):
     def _show_about(self) -> None:
         messagebox.showinfo(
             "Acerca de",
-            "Monitor de afinación vocal - Etapa 5\n\n"
-            "Backend actual: autocorrelación FFT con NumPy.\n"
-            "Esta etapa agrega persistencia automática de configuración en settings.json.\n"
-            "La configuración incluye escala, tonalidad, rango, tolerancia, A4, idioma, \n"
-            "parámetros de detección, estabilidad, ventana y fuente de entrada.\n\n"
+            "Monitor de afinación vocal - Etapa 6\n\n"
+            "Backends incluidos: Autocorrelación FFT y YIN CMND con NumPy.\n"
+            "Backends opcionales: Torchcrepe tiny/full, si instalas torch y torchcrepe.\n"
+            "La configuración guarda también el backend seleccionado.\n\n"
             f"Archivo de configuración:\n{self.settings_path}",
         )
 

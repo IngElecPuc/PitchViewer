@@ -1,0 +1,5 @@
+# Dependencias opcionales para los backends Torchcrepe.
+# En Windows con Python muy reciente puede no existir wheel compatible de torch.
+# Instalar solo si tu entorno lo soporta.
+torch
+torchcrepe
