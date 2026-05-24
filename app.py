@@ -24,6 +24,7 @@ try:
 except ImportError:
     sd = None
 
+from .version import APP_DISPLAY_NAME, APP_VERSION
 from .config.settings import (
     AppSettings,
     default_settings,
@@ -106,7 +107,7 @@ class PitchViewerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
 
-        self.title("Monitor de afinación vocal - v0.10.0")
+        self.title(APP_DISPLAY_NAME)
 
         self.settings_load_result = load_settings()
         self.settings = self.settings_load_result.settings
@@ -613,7 +614,7 @@ class PitchViewerApp(tk.Tk):
         self.footer = ttk.Label(
             root,
             text=(
-                "v0.10.0: karaoke play contra targets .pvk; "
+                f"v{APP_VERSION}: karaoke play contra targets .pvk; "
                 "captura de voz y scoring simple por tolerancia."
             ),
             anchor="w",
@@ -4525,7 +4526,7 @@ class PitchViewerApp(tk.Tk):
     def _show_about(self) -> None:
         messagebox.showinfo(
             "Acerca de",
-            "Monitor de afinación vocal - v0.10.0\n\n"
+            f"Monitor de afinación vocal - v{APP_VERSION}\n\n"
             "Incluye karaoke producción/play, separación IA offline, motores Demucs y Audio Separator / UVR, y exportación WAV/MP3.\n"
             "Si no hay CUDA, los procesos offline pueden correr en CPU; CUDA solo acelera.\n"
             "Para MP3/M4A/MP4 y exportar MP3 se requiere ffmpeg en PATH.\n\n"

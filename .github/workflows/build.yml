@@ -1,0 +1,59 @@
+name: Build PitchViewer
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: PitchViewer-windows-x64
+          - os: ubuntu-latest
+            artifact_name: PitchViewer-ubuntu-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk portaudio19-dev ffmpeg
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python tools/install_project_dependencies.py --base --build
+
+      - name: Diagnose environment
+        run: |
+          python tools/diagnose_environment.py
+
+      - name: Build application
+        run: |
+          python tools/build_app.py --profile base
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            dist/releases/*
+            dist/PitchViewer-*/

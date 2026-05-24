@@ -1,0 +1,2 @@
+# Dependencias para construir ejecutables con tools/build_app.py.
+pyinstaller>=6.0

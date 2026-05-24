@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
 
-"""Pitch Viewer package."""
+from .version import APP_NAME, APP_VERSION, APP_DISPLAY_NAME
 
-__version__ = "0.8.2"
+__all__ = ["APP_NAME", "APP_VERSION", "APP_DISPLAY_NAME"]

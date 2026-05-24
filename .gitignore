@@ -1,2 +1,22 @@
-/venv/
+# Python
 __pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Runtime/output
+*.pvk
+diagnostics/
+separated/
+exports/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

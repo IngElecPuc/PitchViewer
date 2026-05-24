@@ -1,0 +1,11 @@
+[project]
+name = "pitchviewer"
+version = "1.0.0"
+description = "Desktop vocal pitch viewer, karaoke producer/player and offline source separation tools"
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "MIT" }
+
+[tool.pitchviewer]
+entrypoint = "main.py"
+build-script = "tools/build_app.py"
