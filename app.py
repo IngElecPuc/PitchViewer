@@ -1,22 +1,16 @@
 # -*- coding: utf-8 -*-
 
-"""
-Pitch Viewer - Etapa 3
-
-Aplicación de escritorio con refinamiento de seguimiento vocal:
-- captura de entrada con sounddevice;
-- detección F0 monofónica con autocorrelación FFT;
-- estabilización temporal con mediana, suavizado y guardia de octava;
-- visualización tipo piano-roll en Tkinter con bandas de tolerancia, escala y evaluación de afinación.
-"""
+"""Ventana principal de Pitch Viewer."""
 
 import csv
 import math
+import os
 import queue
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
 from typing import Callable, Optional
 
 import tkinter as tk
@@ -29,633 +23,62 @@ try:
 except ImportError:
     sd = None
 
-
-NOTE_NAMES = {
-    "es": [
-        "Do",
-        "Do♯",
-        "Re",
-        "Mi♭",
-        "Mi",
-        "Fa",
-        "Fa♯",
-        "Sol",
-        "Sol♯",
-        "La",
-        "Si♭",
-        "Si",
-    ],
-    "en": [
-        "C",
-        "C♯",
-        "D",
-        "E♭",
-        "E",
-        "F",
-        "F♯",
-        "G",
-        "G♯",
-        "A",
-        "B♭",
-        "B",
-    ],
-}
-
-LANGUAGE_LABELS = {
-    "es": "Español",
-    "en": "English",
-}
-
-SCALE_INTERVALS = {
-    "chromatic": list(range(12)),
-    "major": [0, 2, 4, 5, 7, 9, 11],
-    "natural_minor": [0, 2, 3, 5, 7, 8, 10],
-    "harmonic_minor": [0, 2, 3, 5, 7, 8, 11],
-    "melodic_minor": [0, 2, 3, 5, 7, 9, 11],
-    "major_pentatonic": [0, 2, 4, 7, 9],
-    "minor_pentatonic": [0, 3, 5, 7, 10],
-    "blues": [0, 3, 5, 6, 7, 10],
-}
-
-SCALE_LABELS = {
-    "es": {
-        "chromatic": "cromática",
-        "major": "mayor",
-        "natural_minor": "menor natural",
-        "harmonic_minor": "menor armónica",
-        "melodic_minor": "menor melódica",
-        "major_pentatonic": "pentatónica mayor",
-        "minor_pentatonic": "pentatónica menor",
-        "blues": "blues",
-    },
-    "en": {
-        "chromatic": "chromatic",
-        "major": "major",
-        "natural_minor": "natural minor",
-        "harmonic_minor": "harmonic minor",
-        "melodic_minor": "melodic minor",
-        "major_pentatonic": "major pentatonic",
-        "minor_pentatonic": "minor pentatonic",
-        "blues": "blues",
-    },
-}
-
-RANGE_PRESETS = [
-    ("Voz grave: Mi2 - Mi4", 40, 64),
-    ("Voz media: La2 - La4", 45, 69),
-    ("Voz aguda: Do3 - Do6", 48, 84),
-    ("Amplio: Mi2 - Do6", 40, 84),
-    ("Muy amplio: Do2 - Do7", 36, 96),
-]
-
-TIME_WINDOWS = [5, 10, 20, 30]
-TOLERANCE_OPTIONS = [10, 20, 30, 40, 50]
-A4_OPTIONS = [440.0, 441.0, 442.0]
-
-DEFAULT_MIN_MIDI = 40
-DEFAULT_MAX_MIDI = 84
-MIN_MIDI_CHOICE = 24
-MAX_MIDI_CHOICE = 108
-
-MIN_DETECTABLE_HZ = 50.0
-MAX_DETECTABLE_HZ = 2000.0
-
-
-@dataclass
-class AppSettings:
-    a4_hz: float = 440.0
-    note_language: str = "es"
-    time_window_s: int = 10
-    min_midi: int = DEFAULT_MIN_MIDI
-    max_midi: int = DEFAULT_MAX_MIDI
-    scale_name: str = "chromatic"
-    scale_root: int = 0
-    tolerance_cents: int = 30
-    show_out_of_scale: bool = True
-    show_tolerance_bands: bool = True
-    show_center_lines: bool = True
-    confidence_threshold: float = 0.35
-    rms_threshold: float = 0.006
-    smoothing_factor: float = 0.35
-    median_window: int = 5
-    max_jump_semitones: float = 7.0
-    octave_guard: bool = True
-
-
-@dataclass
-class PitchPoint:
-    time_s: float
-    freq_hz: float
-    midi_float: float
-    raw_midi_float: float
-    confidence: float
-    rms: float
-    voiced: bool
-
-    @property
-    def cents(self) -> float:
-        if not self.voiced or math.isnan(self.midi_float):
-            return float("nan")
-        return cents_from_nearest_note(self.midi_float)
-
-
-@dataclass
-class InputDevice:
-    index: int
-    name: str
-    channels: int
-    default_samplerate: int
-
-    @property
-    def label(self) -> str:
-        return f"{self.index}: {self.name} ({self.channels} ch, {self.default_samplerate} Hz)"
-
-
-def freq_to_midi(freq_hz: float, a4_hz: float = 440.0) -> float:
-    return 69.0 + 12.0 * math.log2(freq_hz / a4_hz)
-
-
-def midi_to_freq(midi_value: float, a4_hz: float = 440.0) -> float:
-    return a4_hz * (2.0 ** ((midi_value - 69.0) / 12.0))
-
-
-def midi_to_octave(midi_value: int) -> int:
-    return (midi_value // 12) - 1
-
-
-def midi_to_note_name(midi_value: int, language: str = "es") -> str:
-    names = NOTE_NAMES.get(language, NOTE_NAMES["es"])
-    return f"{names[midi_value % 12]}{midi_to_octave(midi_value)}"
-
-
-def pitch_class_name(pitch_class: int, language: str = "es") -> str:
-    names = NOTE_NAMES.get(language, NOTE_NAMES["es"])
-    return names[pitch_class % 12]
-
-
-def cents_from_nearest_note(midi_float: float) -> float:
-    return 100.0 * (midi_float - round(midi_float))
-
-
-def build_note_choices(language: str = "es") -> list[str]:
-    return [
-        midi_to_note_name(midi, language)
-        for midi in range(MIN_MIDI_CHOICE, MAX_MIDI_CHOICE + 1)
-    ]
-
-
-def build_note_to_midi(language: str = "es") -> dict[str, int]:
-    return {
-        midi_to_note_name(midi, language): midi
-        for midi in range(MIN_MIDI_CHOICE, MAX_MIDI_CHOICE + 1)
-    }
-
-
-def scale_pitch_classes(root: int, scale_name: str) -> set[int]:
-    intervals = SCALE_INTERVALS.get(scale_name, SCALE_INTERVALS["chromatic"])
-    return {(root + interval) % 12 for interval in intervals}
-
-
-def scale_display_name(settings: AppSettings) -> str:
-    language = settings.note_language
-    root = pitch_class_name(settings.scale_root, language)
-    label = SCALE_LABELS.get(language, SCALE_LABELS["es"]).get(
-        settings.scale_name,
-        settings.scale_name,
-    )
-
-    if settings.scale_name == "chromatic":
-        return label.capitalize()
-
-    return f"{root} {label}"
-
-
-def next_power_of_two(value: int) -> int:
-    return 1 << (value - 1).bit_length()
-
-
-def estimate_pitch_autocorrelation(
-    frame: np.ndarray,
-    sample_rate: int,
-    min_hz: float,
-    max_hz: float,
-) -> tuple[float, float]:
-    """
-    Estima F0 con autocorrelación FFT sobre un frame monofónico.
-
-    Retorna:
-        (freq_hz, confidence)
-
-    Este detector es portable y no requiere aubio. Es suficiente para validar la app,
-    aunque no reemplaza a YIN/pYIN/CREPE en casos difíciles.
-    """
-    if frame.size < 32:
-        return 0.0, 0.0
-
-    x = np.asarray(frame, dtype=np.float64)
-    x = x - np.mean(x)
-
-    energy = float(np.dot(x, x))
-    if energy <= 1e-12:
-        return 0.0, 0.0
-
-    x = x * np.hanning(x.size)
-
-    min_hz = max(MIN_DETECTABLE_HZ, float(min_hz))
-    max_hz = min(MAX_DETECTABLE_HZ, float(max_hz))
-
-    if max_hz <= min_hz:
-        min_hz = MIN_DETECTABLE_HZ
-        max_hz = MAX_DETECTABLE_HZ
-
-    min_lag = max(1, int(sample_rate / max_hz))
-    max_lag = min(x.size - 2, int(sample_rate / min_hz))
-
-    if max_lag <= min_lag + 2:
-        return 0.0, 0.0
-
-    nfft = next_power_of_two(x.size * 2)
-    spectrum = np.fft.rfft(x, n=nfft)
-    corr = np.fft.irfft(spectrum * np.conj(spectrum), n=nfft)[: x.size]
-
-    normalization = np.arange(x.size, 0, -1, dtype=np.float64)
-    corr = corr / normalization
-
-    zero_lag = float(corr[0])
-    if zero_lag <= 1e-12:
-        return 0.0, 0.0
-
-    search = corr[min_lag : max_lag + 1]
-
-    if search.size < 3:
-        return 0.0, 0.0
-
-    local_max_mask = (search[1:-1] > search[:-2]) & (search[1:-1] >= search[2:])
-    local_max_indices = np.where(local_max_mask)[0] + 1
-
-    if local_max_indices.size == 0:
-        peak_relative = int(np.argmax(search))
-    else:
-        local_values = search[local_max_indices]
-        best_value = float(np.max(local_values))
-        strong = local_max_indices[local_values >= best_value * 0.85]
-        peak_relative = int(strong[0]) if strong.size else int(local_max_indices[np.argmax(local_values)])
-
-    peak_lag = min_lag + peak_relative
-
-    if peak_lag <= 0 or peak_lag >= corr.size - 1:
-        return 0.0, 0.0
-
-    y0 = float(corr[peak_lag - 1])
-    y1 = float(corr[peak_lag])
-    y2 = float(corr[peak_lag + 1])
-
-    denominator = y0 - 2.0 * y1 + y2
-    if abs(denominator) > 1e-12:
-        delta = 0.5 * (y0 - y2) / denominator
-        delta = max(-0.5, min(0.5, delta))
-    else:
-        delta = 0.0
-
-    refined_lag = float(peak_lag) + delta
-    freq_hz = float(sample_rate) / refined_lag
-    confidence = max(0.0, min(1.0, y1 / zero_lag))
-
-    if not math.isfinite(freq_hz):
-        return 0.0, 0.0
-
-    return freq_hz, confidence
-
-
-class RangeDialog(tk.Toplevel):
-    def __init__(
-        self,
-        parent: tk.Tk,
-        settings: AppSettings,
-    ) -> None:
-        super().__init__(parent)
-
-        self.title("Rango visible por nota")
-        self.transient(parent)
-        self.resizable(False, False)
-        self.result: Optional[tuple[int, int]] = None
-        self.settings = settings
-
-        self.note_choices = build_note_choices(settings.note_language)
-        self.note_to_midi = build_note_to_midi(settings.note_language)
-
-        self.min_note_var = tk.StringVar(
-            value=midi_to_note_name(settings.min_midi, settings.note_language)
-        )
-        self.max_note_var = tk.StringVar(
-            value=midi_to_note_name(settings.max_midi, settings.note_language)
-        )
-
-        body = ttk.Frame(self, padding=12)
-        body.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(body, text="Nota inferior:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Combobox(
-            body,
-            textvariable=self.min_note_var,
-            values=self.note_choices,
-            state="readonly",
-            width=12,
-        ).grid(row=0, column=1, sticky="w", pady=6)
-
-        ttk.Label(body, text="Nota superior:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Combobox(
-            body,
-            textvariable=self.max_note_var,
-            values=self.note_choices,
-            state="readonly",
-            width=12,
-        ).grid(row=1, column=1, sticky="w", pady=6)
-
-        buttons = ttk.Frame(body)
-        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(12, 0))
-
-        ttk.Button(buttons, text="Cancelar", command=self._cancel).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(buttons, text="Aceptar", command=self._accept).pack(side=tk.RIGHT)
-
-        self.bind("<Escape>", lambda _event: self._cancel())
-        self.bind("<Return>", lambda _event: self._accept())
-
-        self.grab_set()
-        self.update_idletasks()
-        self._center_over_parent(parent)
-        self.wait_window(self)
-
-    def _center_over_parent(self, parent: tk.Tk) -> None:
-        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_reqwidth()) // 2)
-        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_reqheight()) // 2)
-        self.geometry(f"+{x}+{y}")
-
-    def _accept(self) -> None:
-        min_midi = self.note_to_midi.get(self.min_note_var.get())
-        max_midi = self.note_to_midi.get(self.max_note_var.get())
-
-        if min_midi is None or max_midi is None:
-            messagebox.showerror("Rango inválido", "Selecciona dos notas válidas.", parent=self)
-            return
-
-        if max_midi <= min_midi:
-            messagebox.showerror(
-                "Rango inválido",
-                "La nota superior debe estar por encima de la nota inferior.",
-                parent=self,
-            )
-            return
-
-        self.result = (min_midi, max_midi)
-        self.destroy()
-
-    def _cancel(self) -> None:
-        self.result = None
-        self.destroy()
-
-
-class InputDeviceDialog(tk.Toplevel):
-    def __init__(
-        self,
-        parent: tk.Tk,
-        devices: list[InputDevice],
-        selected_index: Optional[int],
-    ) -> None:
-        super().__init__(parent)
-
-        self.title("Fuente de entrada")
-        self.transient(parent)
-        self.resizable(True, False)
-        self.devices = devices
-        self.result: Optional[int] = None
-
-        body = ttk.Frame(self, padding=12)
-        body.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(body, text="Selecciona el dispositivo de entrada:").pack(anchor="w", pady=(0, 6))
-
-        self.listbox = tk.Listbox(body, height=10, width=78, exportselection=False)
-        self.listbox.pack(fill=tk.BOTH, expand=True)
-
-        for device in devices:
-            self.listbox.insert(tk.END, device.label)
-
-        if devices:
-            selection = 0
-            for idx, device in enumerate(devices):
-                if device.index == selected_index:
-                    selection = idx
-                    break
-
-            self.listbox.selection_set(selection)
-            self.listbox.see(selection)
-
-        buttons = ttk.Frame(body)
-        buttons.pack(fill=tk.X, pady=(10, 0))
-
-        ttk.Button(buttons, text="Cancelar", command=self._cancel).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(buttons, text="Aceptar", command=self._accept).pack(side=tk.RIGHT)
-
-        self.listbox.bind("<Double-Button-1>", lambda _event: self._accept())
-        self.bind("<Escape>", lambda _event: self._cancel())
-        self.bind("<Return>", lambda _event: self._accept())
-
-        self.grab_set()
-        self.update_idletasks()
-        self._center_over_parent(parent)
-        self.wait_window(self)
-
-    def _center_over_parent(self, parent: tk.Tk) -> None:
-        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_reqwidth()) // 2)
-        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_reqheight()) // 2)
-        self.geometry(f"+{x}+{y}")
-
-    def _accept(self) -> None:
-        selection = self.listbox.curselection()
-
-        if not selection:
-            messagebox.showerror("Entrada no válida", "Selecciona un dispositivo.", parent=self)
-            return
-
-        self.result = self.devices[int(selection[0])].index
-        self.destroy()
-
-    def _cancel(self) -> None:
-        self.result = None
-        self.destroy()
-
-
-class DetectorSettingsDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Tk, settings: AppSettings) -> None:
-        super().__init__(parent)
-
-        self.title("Parámetros de detección")
-        self.transient(parent)
-        self.resizable(False, False)
-        self.result: Optional[tuple[float, float, float]] = None
-
-        self.confidence_var = tk.StringVar(value=f"{settings.confidence_threshold:.3f}")
-        self.rms_var = tk.StringVar(value=f"{settings.rms_threshold:.4f}")
-        self.smoothing_var = tk.StringVar(value=f"{settings.smoothing_factor:.3f}")
-
-        body = ttk.Frame(self, padding=12)
-        body.pack(fill=tk.BOTH, expand=True)
-
-        rows = [
-            ("Confianza mínima:", self.confidence_var, "0.00 a 1.00"),
-            ("RMS mínimo:", self.rms_var, "por ejemplo 0.004 a 0.020"),
-            ("Suavizado visual:", self.smoothing_var, "0.00 a 1.00"),
-        ]
-
-        for row, (label, var, hint) in enumerate(rows):
-            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=5)
-            ttk.Entry(body, textvariable=var, width=12).grid(row=row, column=1, sticky="w", pady=5)
-            ttk.Label(body, text=hint).grid(row=row, column=2, sticky="w", padx=(8, 0), pady=5)
-
-        buttons = ttk.Frame(body)
-        buttons.grid(row=len(rows), column=0, columnspan=3, sticky="e", pady=(12, 0))
-
-        ttk.Button(buttons, text="Cancelar", command=self._cancel).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(buttons, text="Aceptar", command=self._accept).pack(side=tk.RIGHT)
-
-        self.bind("<Escape>", lambda _event: self._cancel())
-        self.bind("<Return>", lambda _event: self._accept())
-
-        self.grab_set()
-        self.update_idletasks()
-        self._center_over_parent(parent)
-        self.wait_window(self)
-
-    def _center_over_parent(self, parent: tk.Tk) -> None:
-        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_reqwidth()) // 2)
-        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_reqheight()) // 2)
-        self.geometry(f"+{x}+{y}")
-
-    def _accept(self) -> None:
-        try:
-            confidence = float(self.confidence_var.get())
-            rms = float(self.rms_var.get())
-            smoothing = float(self.smoothing_var.get())
-        except ValueError:
-            messagebox.showerror("Valor inválido", "Todos los valores deben ser numéricos.", parent=self)
-            return
-
-        if not 0.0 <= confidence <= 1.0:
-            messagebox.showerror("Valor inválido", "La confianza debe estar entre 0 y 1.", parent=self)
-            return
-
-        if not 0.0 <= rms <= 1.0:
-            messagebox.showerror("Valor inválido", "El RMS debe estar entre 0 y 1.", parent=self)
-            return
-
-        if not 0.0 <= smoothing <= 1.0:
-            messagebox.showerror("Valor inválido", "El suavizado debe estar entre 0 y 1.", parent=self)
-            return
-
-        self.result = (confidence, rms, smoothing)
-        self.destroy()
-
-    def _cancel(self) -> None:
-        self.result = None
-        self.destroy()
-
-
-class StabilitySettingsDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Tk, settings: AppSettings) -> None:
-        super().__init__(parent)
-
-        self.title("Estabilidad de pitch")
-        self.transient(parent)
-        self.resizable(False, False)
-        self.result: Optional[tuple[int, float, bool]] = None
-
-        self.median_var = tk.StringVar(value=str(settings.median_window))
-        self.max_jump_var = tk.StringVar(value=f"{settings.max_jump_semitones:.1f}")
-        self.octave_guard_var = tk.BooleanVar(value=settings.octave_guard)
-
-        body = ttk.Frame(self, padding=12)
-        body.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(body, text="Ventana de mediana:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
-        ttk.Entry(body, textvariable=self.median_var, width=12).grid(row=0, column=1, sticky="w", pady=5)
-        ttk.Label(body, text="frames; recomendado: 3, 5 o 7").grid(row=0, column=2, sticky="w", padx=(8, 0), pady=5)
-
-        ttk.Label(body, text="Salto máximo:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
-        ttk.Entry(body, textvariable=self.max_jump_var, width=12).grid(row=1, column=1, sticky="w", pady=5)
-        ttk.Label(body, text="semitonos por frame; recomendado: 5 a 9").grid(row=1, column=2, sticky="w", padx=(8, 0), pady=5)
-
-        ttk.Checkbutton(
-            body,
-            text="Corregir saltos falsos de octava",
-            variable=self.octave_guard_var,
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 4))
-
-        hint = ttk.Label(
-            body,
-            text=(
-                "La mediana reduce temblores del detector. La guardia de octava busca \"plegar\" "
-                "saltos ±12 semitonos cuando el frame anterior sugiere que son errores."
-            ),
-            wraplength=520,
-        )
-        hint.grid(row=3, column=0, columnspan=3, sticky="we", pady=(4, 0))
-
-        buttons = ttk.Frame(body)
-        buttons.grid(row=4, column=0, columnspan=3, sticky="e", pady=(12, 0))
-
-        ttk.Button(buttons, text="Cancelar", command=self._cancel).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(buttons, text="Aceptar", command=self._accept).pack(side=tk.RIGHT)
-
-        self.bind("<Escape>", lambda _event: self._cancel())
-        self.bind("<Return>", lambda _event: self._accept())
-
-        self.grab_set()
-        self.update_idletasks()
-        self._center_over_parent(parent)
-        self.wait_window(self)
-
-    def _center_over_parent(self, parent: tk.Tk) -> None:
-        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_reqwidth()) // 2)
-        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_reqheight()) // 2)
-        self.geometry(f"+{x}+{y}")
-
-    def _accept(self) -> None:
-        try:
-            median_window = int(self.median_var.get())
-            max_jump = float(self.max_jump_var.get())
-        except ValueError:
-            messagebox.showerror("Valor inválido", "Los valores deben ser numéricos.", parent=self)
-            return
-
-        if median_window < 1 or median_window > 21:
-            messagebox.showerror("Valor inválido", "La ventana de mediana debe estar entre 1 y 21.", parent=self)
-            return
-
-        if median_window % 2 == 0:
-            median_window += 1
-
-        if not 1.0 <= max_jump <= 24.0:
-            messagebox.showerror("Valor inválido", "El salto máximo debe estar entre 1 y 24 semitonos.", parent=self)
-            return
-
-        self.result = (median_window, max_jump, bool(self.octave_guard_var.get()))
-        self.destroy()
-
-    def _cancel(self) -> None:
-        self.result = None
-        self.destroy()
+from .config.settings import (
+    AppSettings,
+    default_settings,
+    get_settings_dir,
+    load_settings,
+    normalize_settings,
+    save_settings,
+)
+from .constants import (
+    A4_OPTIONS,
+    MAX_DETECTABLE_HZ,
+    MAX_MIDI_CHOICE,
+    MIN_DETECTABLE_HZ,
+    MIN_MIDI_CHOICE,
+    RANGE_PRESETS,
+    TIME_WINDOWS,
+    TOLERANCE_OPTIONS,
+)
+from .detection.autocorrelation import estimate_pitch_autocorrelation
+from .models import InputDevice, PitchPoint
+from .music.notes import (
+    LANGUAGE_LABELS,
+    NOTE_NAMES,
+    cents_from_nearest_note,
+    freq_to_midi,
+    midi_to_freq,
+    midi_to_note_name,
+    pitch_class_name,
+)
+from .music.scales import (
+    SCALE_INTERVALS,
+    SCALE_LABELS,
+    scale_display_name,
+    scale_pitch_classes,
+)
+from .ui.dialogs import (
+    DetectorSettingsDialog,
+    InputDeviceDialog,
+    RangeDialog,
+    StabilitySettingsDialog,
+)
 
 
 class PitchViewerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
 
-        self.title("Monitor de afinación vocal - Etapa 3")
-        self.geometry("1120x780")
+        self.title("Monitor de afinación vocal - Etapa 5")
+
+        self.settings_load_result = load_settings()
+        self.settings = self.settings_load_result.settings
+        self.settings_path = self.settings_load_result.path
+
+        self.geometry(self.settings.window_geometry)
         self.minsize(900, 600)
 
-        self.settings = AppSettings()
         self.settings_lock = threading.Lock()
 
         self.audio_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=30)
@@ -677,7 +100,7 @@ class PitchViewerApp(tk.Tk):
         self.recent_midi_values: deque[float] = deque(maxlen=self.settings.median_window)
 
         self.audio_devices: list[InputDevice] = []
-        self.selected_device_index: Optional[int] = None
+        self.selected_device_index: Optional[int] = self.settings.selected_input_device_index
 
         self.language_var = tk.StringVar(value=self.settings.note_language)
         self.scale_name_var = tk.StringVar(value=self.settings.scale_name)
@@ -699,11 +122,13 @@ class PitchViewerApp(tk.Tk):
         self.audio_status_var = tk.StringVar(value="Audio: detenido")
         self.device_status_var = tk.StringVar(value="Entrada: —")
         self.settings_status_var = tk.StringVar(value="")
+        self.config_status_var = tk.StringVar(value="")
 
         self._build_menu()
         self._build_ui()
         self._load_audio_devices(select_default=True)
         self._refresh_status_labels()
+        self._refresh_config_status_after_load()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(33, self._ui_loop)
@@ -714,6 +139,11 @@ class PitchViewerApp(tk.Tk):
         file_menu = tk.Menu(menubar, tearoff=False)
         file_menu.add_command(label="Limpiar historial", command=self._clear_history)
         file_menu.add_command(label="Exportar historial CSV...", command=self._export_history_csv)
+        file_menu.add_separator()
+        file_menu.add_command(label="Guardar configuración", command=self._save_settings_now)
+        file_menu.add_command(label="Recargar configuración", command=self._reload_settings_from_disk)
+        file_menu.add_command(label="Restaurar configuración predeterminada...", command=self._reset_settings_to_defaults)
+        file_menu.add_command(label="Abrir carpeta de configuración", command=self._open_settings_folder)
         file_menu.add_separator()
         file_menu.add_command(label="Salir", command=self._on_close)
         menubar.add_cascade(label="Archivo", menu=file_menu)
@@ -875,6 +305,7 @@ class PitchViewerApp(tk.Tk):
         ttk.Label(settings_row, textvariable=self.scale_status_var).pack(side=tk.LEFT, padx=(0, 18))
         ttk.Label(settings_row, textvariable=self.range_status_var).pack(side=tk.LEFT, padx=(0, 18))
         ttk.Label(settings_row, textvariable=self.settings_status_var).pack(side=tk.LEFT, padx=(0, 18))
+        ttk.Label(settings_row, textvariable=self.config_status_var).pack(side=tk.RIGHT, padx=(0, 0))
 
         self.canvas = tk.Canvas(
             root,
@@ -886,12 +317,186 @@ class PitchViewerApp(tk.Tk):
         footer = ttk.Label(
             root,
             text=(
-                "Etapa 3: estabilización, bandas de tolerancia, evaluación de afinación y exportación CSV. "
+                "Etapa 5: configuración persistente en settings.json; mantiene estabilización, tolerancia, evaluación de afinación y exportación CSV. "
                 "Usa audífonos para evitar que el micrófono capture los parlantes."
             ),
             anchor="w",
         )
         footer.pack(fill=tk.X, side=tk.BOTTOM, pady=(6, 0))
+
+    def _refresh_config_status_after_load(self) -> None:
+        if self.settings_load_result.error:
+            self.config_status_var.set(
+                f"Config: defaults por error; revisar {self.settings_path}"
+            )
+            messagebox.showwarning(
+                "Configuración",
+                f"No se pudo cargar la configuración guardada. Se usarán valores por defecto.\n\n"
+                f"Detalle: {self.settings_load_result.error}",
+                parent=self,
+            )
+            return
+
+        if self.settings_load_result.loaded:
+            self.config_status_var.set(f"Config: cargada desde {self.settings_path}")
+        else:
+            self.config_status_var.set(f"Config: se guardará en {self.settings_path}")
+
+    def _capture_persistent_state(self) -> None:
+        geometry = self.geometry()
+        device = self._selected_device()
+
+        with self.settings_lock:
+            self.settings.window_geometry = geometry
+            if device is not None:
+                self.settings.selected_input_device_index = int(device.index)
+                self.settings.selected_input_device_name = device.name
+            else:
+                self.settings.selected_input_device_index = self.selected_device_index
+                self.settings.selected_input_device_name = ""
+            self.settings = normalize_settings(self.settings)
+
+    def _save_settings_now(self, show_message: bool = True) -> bool:
+        self._capture_persistent_state()
+
+        with self.settings_lock:
+            settings = AppSettings(**self.settings.__dict__)
+
+        try:
+            path = save_settings(settings, self.settings_path)
+        except Exception as exc:
+            self.config_status_var.set("Config: error al guardar")
+            if show_message:
+                messagebox.showerror(
+                    "Guardar configuración",
+                    f"No se pudo guardar la configuración:\n\n{exc}",
+                    parent=self,
+                )
+            return False
+
+        self.config_status_var.set(f"Config: guardada en {path}")
+        if show_message:
+            messagebox.showinfo("Guardar configuración", f"Configuración guardada:\n{path}", parent=self)
+        return True
+
+    def _autosave_settings(self) -> None:
+        self._save_settings_now(show_message=False)
+
+    def _reload_settings_from_disk(self) -> None:
+        result = load_settings(self.settings_path)
+        if result.error:
+            messagebox.showerror(
+                "Recargar configuración",
+                f"No se pudo recargar la configuración:\n\n{result.error}",
+                parent=self,
+            )
+            return
+
+        was_running = self.is_running
+        if was_running:
+            self.stop_audio()
+
+        with self.settings_lock:
+            self.settings = result.settings
+
+        self.selected_device_index = result.settings.selected_input_device_index
+        self._apply_settings_to_variables()
+        self._load_audio_devices(select_default=True)
+        self._refresh_status_labels()
+        self._rebuild_menu()
+        self.config_status_var.set(f"Config: recargada desde {result.path}")
+
+        if was_running:
+            self.start_audio()
+
+    def _reset_settings_to_defaults(self) -> None:
+        answer = messagebox.askyesno(
+            "Restaurar configuración",
+            "Esto reemplazará la configuración actual por valores predeterminados.\n\n¿Continuar?",
+            parent=self,
+        )
+        if not answer:
+            return
+
+        was_running = self.is_running
+        if was_running:
+            self.stop_audio()
+
+        with self.settings_lock:
+            self.settings = default_settings()
+
+        self.selected_device_index = None
+        self._apply_settings_to_variables()
+        self._load_audio_devices(select_default=True)
+        self._refresh_status_labels()
+        self._rebuild_menu()
+        self._save_settings_now(show_message=False)
+        self.config_status_var.set("Config: restaurada a valores predeterminados")
+
+        if was_running:
+            self.start_audio()
+
+    def _open_settings_folder(self) -> None:
+        folder = get_settings_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if os.name == "nt":
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except Exception as exc:
+            messagebox.showerror(
+                "Carpeta de configuración",
+                f"No se pudo abrir la carpeta:\n\n{folder}\n\n{exc}",
+                parent=self,
+            )
+
+    def _apply_settings_to_variables(self) -> None:
+        with self.settings_lock:
+            settings = AppSettings(**self.settings.__dict__)
+
+        self.language_var.set(settings.note_language)
+        self.scale_name_var.set(settings.scale_name)
+        self.scale_root_var.set(settings.scale_root)
+        self.time_window_var.set(settings.time_window_s)
+        self.tolerance_var.set(settings.tolerance_cents)
+        self.a4_var.set(f"{settings.a4_hz:.1f}")
+        self.show_out_of_scale_var.set(settings.show_out_of_scale)
+        self.show_tolerance_bands_var.set(settings.show_tolerance_bands)
+        self.show_center_lines_var.set(settings.show_center_lines)
+
+        try:
+            self.geometry(settings.window_geometry)
+        except Exception:
+            pass
+
+    def _resolve_saved_device_index(self, devices: list[InputDevice]) -> Optional[int]:
+        if not devices:
+            return None
+
+        with self.settings_lock:
+            saved_name = self.settings.selected_input_device_name.strip().casefold()
+            saved_index = self.settings.selected_input_device_index
+
+        if saved_name:
+            for device in devices:
+                if device.name.strip().casefold() == saved_name:
+                    return device.index
+
+            for device in devices:
+                name = device.name.strip().casefold()
+                if saved_name in name or name in saved_name:
+                    return device.index
+
+        if saved_index is not None:
+            for device in devices:
+                if device.index == saved_index:
+                    return device.index
+
+        return None
 
     def _load_audio_devices(self, select_default: bool) -> None:
         if sd is None:
@@ -926,24 +531,28 @@ class PitchViewerApp(tk.Tk):
             return
 
         if select_default or self.selected_device_index is None:
-            default_input_idx = None
-            try:
-                default_input_idx = int(sd.default.device[0])
-            except Exception:
-                default_input_idx = None
+            selected = self._resolve_saved_device_index(devices)
 
-            selected = devices[0].index
-            if default_input_idx is not None and default_input_idx >= 0:
-                for device in devices:
-                    if device.index == default_input_idx:
-                        selected = device.index
-                        break
+            if selected is None:
+                default_input_idx = None
+                try:
+                    default_input_idx = int(sd.default.device[0])
+                except Exception:
+                    default_input_idx = None
+
+                selected = devices[0].index
+                if default_input_idx is not None and default_input_idx >= 0:
+                    for device in devices:
+                        if device.index == default_input_idx:
+                            selected = device.index
+                            break
 
             self.selected_device_index = selected
         else:
             valid_indices = {device.index for device in devices}
             if self.selected_device_index not in valid_indices:
-                self.selected_device_index = devices[0].index
+                selected = self._resolve_saved_device_index(devices)
+                self.selected_device_index = selected if selected is not None else devices[0].index
 
         self._refresh_device_label()
 
@@ -984,6 +593,7 @@ class PitchViewerApp(tk.Tk):
 
         self.selected_device_index = dialog.result
         self._refresh_device_label()
+        self._autosave_settings()
 
         if was_running:
             self.start_audio()
@@ -1037,6 +647,7 @@ class PitchViewerApp(tk.Tk):
             self.is_running = True
             self.audio_status_var.set(f"Audio: capturando a {self.sample_rate} Hz")
             self._refresh_device_label()
+            self._autosave_settings()
 
         except Exception as exc:
             self.stop_audio()
@@ -1224,6 +835,7 @@ class PitchViewerApp(tk.Tk):
             self.settings.time_window_s = int(seconds)
         self.time_window_var.set(int(seconds))
         self._refresh_status_labels()
+        self._autosave_settings()
 
     def _set_visible_range(self, min_midi: int, max_midi: int) -> None:
         if max_midi <= min_midi:
@@ -1234,6 +846,7 @@ class PitchViewerApp(tk.Tk):
             self.settings.max_midi = int(max_midi)
 
         self._refresh_status_labels()
+        self._autosave_settings()
 
     def _open_range_dialog(self) -> None:
         dialog = RangeDialog(self, self.settings)
@@ -1292,6 +905,7 @@ class PitchViewerApp(tk.Tk):
         self.language_var.set(language)
         self._refresh_status_labels()
         self._rebuild_menu()
+        self._autosave_settings()
 
     def _set_scale_name(self, scale_name: str) -> None:
         if scale_name not in SCALE_INTERVALS:
@@ -1302,6 +916,7 @@ class PitchViewerApp(tk.Tk):
 
         self.scale_name_var.set(scale_name)
         self._refresh_status_labels()
+        self._autosave_settings()
 
     def _set_scale_root(self, root: int) -> None:
         with self.settings_lock:
@@ -1309,24 +924,28 @@ class PitchViewerApp(tk.Tk):
 
         self.scale_root_var.set(int(root) % 12)
         self._refresh_status_labels()
+        self._autosave_settings()
 
     def _toggle_out_of_scale(self) -> None:
         with self.settings_lock:
             self.settings.show_out_of_scale = bool(self.show_out_of_scale_var.get())
 
         self._refresh_status_labels()
+        self._autosave_settings()
 
     def _toggle_tolerance_bands(self) -> None:
         with self.settings_lock:
             self.settings.show_tolerance_bands = bool(self.show_tolerance_bands_var.get())
 
         self._refresh_status_labels()
+        self._autosave_settings()
 
     def _toggle_center_lines(self) -> None:
         with self.settings_lock:
             self.settings.show_center_lines = bool(self.show_center_lines_var.get())
 
         self._refresh_status_labels()
+        self._autosave_settings()
 
     def _set_a4(self, hz: float) -> None:
         if hz <= 0:
@@ -1337,6 +956,7 @@ class PitchViewerApp(tk.Tk):
 
         self.a4_var.set(f"{float(hz):.1f}")
         self._refresh_status_labels()
+        self._autosave_settings()
 
     def _open_a4_dialog(self) -> None:
         with self.settings_lock:
@@ -1364,6 +984,7 @@ class PitchViewerApp(tk.Tk):
 
         self.tolerance_var.set(cents)
         self._refresh_status_labels()
+        self._autosave_settings()
 
     def _open_tolerance_dialog(self) -> None:
         with self.settings_lock:
@@ -1394,6 +1015,7 @@ class PitchViewerApp(tk.Tk):
             self.settings.smoothing_factor = smoothing
 
         self._refresh_status_labels()
+        self._autosave_settings()
 
     def _open_stability_settings(self) -> None:
         dialog = StabilitySettingsDialog(self, self.settings)
@@ -1408,6 +1030,7 @@ class PitchViewerApp(tk.Tk):
 
         self.recent_midi_values = deque(list(self.recent_midi_values)[-median_window:], maxlen=median_window)
         self._refresh_status_labels()
+        self._autosave_settings()
 
     def _export_history_csv(self) -> None:
         if not self.points:
@@ -1859,22 +1482,15 @@ class PitchViewerApp(tk.Tk):
     def _show_about(self) -> None:
         messagebox.showinfo(
             "Acerca de",
-            "Monitor de afinación vocal - Etapa 3\n\n"
+            "Monitor de afinación vocal - Etapa 5\n\n"
             "Backend actual: autocorrelación FFT con NumPy.\n"
-            "Esta etapa agrega mediana temporal, guardia de octava, \"jump gate\", \n"
-            "bandas de tolerancia configurables, evaluación de afinación y exportación CSV.\n\n"
-            "Siguiente backend recomendado: torchcrepe o pYIN.",
+            "Esta etapa agrega persistencia automática de configuración en settings.json.\n"
+            "La configuración incluye escala, tonalidad, rango, tolerancia, A4, idioma, \n"
+            "parámetros de detección, estabilidad, ventana y fuente de entrada.\n\n"
+            f"Archivo de configuración:\n{self.settings_path}",
         )
 
     def _on_close(self) -> None:
+        self._save_settings_now(show_message=False)
         self.stop_audio()
         self.destroy()
-
-
-def main() -> None:
-    app = PitchViewerApp()
-    app.mainloop()
-
-
-if __name__ == "__main__":
-    main()
