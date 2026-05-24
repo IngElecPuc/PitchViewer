@@ -49,11 +49,22 @@ from .karaoke.models import KaraokeAudioInfo, KaraokeProject, KaraokeNoteSegment
 from .karaoke.project_file import save_pvk
 from .runtime import RUNTIME_INFO
 from .separation.demucs_separator import (
+    AUDIO_SEPARATOR_MODELS,
+    DEMUCS_MODELS,
+    ENGINE_AUDIO_SEPARATOR,
+    ENGINE_DEMUCS,
+    ENGINE_LABELS,
     STEM_DISPLAY_NAMES,
+    default_model_for_engine,
     default_separation_dir,
+    export_mix_pair_with_gains,
     export_mix_with_gains,
+    is_audio_separator_available,
     is_demucs_available,
-    run_demucs_separation,
+    is_ffmpeg_available,
+    models_for_engine,
+    normalize_engine_id,
+    run_ai_separation,
 )
 from .separation.models import SeparationResult
 from .detection.registry import (
@@ -94,7 +105,7 @@ class PitchViewerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
 
-        self.title("Monitor de afinación vocal - v0.9.3")
+        self.title("Monitor de afinación vocal - v0.9.4")
 
         self.settings_load_result = load_settings()
         self.settings = self.settings_load_result.settings
@@ -200,6 +211,7 @@ class PitchViewerApp(tk.Tk):
         self.separation_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.separation_running = False
         self.separation_output_root = default_separation_dir()
+        self.separation_engine_var = tk.StringVar(value=ENGINE_DEMUCS)
         self.separation_model_var = tk.StringVar(value="htdemucs")
         self.separation_mode_var = tk.StringVar(value="4stems")
         self.separation_device_var = tk.StringVar(value="cuda" if self.cuda_available else "cpu")
@@ -485,10 +497,12 @@ class PitchViewerApp(tk.Tk):
         separation_menu.add_command(label="Mostrar/ocultar panel separación IA", command=self._toggle_separation_panel)
         separation_menu.add_separator()
         separation_menu.add_command(label="Abrir canción/mezcla...", command=self._load_separation_source)
-        separation_menu.add_command(label="Separar pistas con Demucs", command=self._start_ai_separation)
+        separation_menu.add_command(label="Separar pistas offline", command=self._start_ai_separation)
         separation_menu.add_separator()
         separation_menu.add_command(label="Usar stem de voz como pista karaoke", command=self._use_vocals_stem_for_karaoke)
-        separation_menu.add_command(label="Exportar mezcla con ganancias...", command=self._export_separation_mix)
+        separation_menu.add_command(label="Exportar mezcla MP3...", command=lambda: self._export_separation_mix("mp3"))
+        separation_menu.add_command(label="Exportar mezcla WAV...", command=lambda: self._export_separation_mix("wav"))
+        separation_menu.add_command(label="Exportar mezcla WAV + MP3...", command=lambda: self._export_separation_mix("both"))
         menubar.add_cascade(label="Separación IA", menu=separation_menu)
 
         help_menu = tk.Menu(menubar, tearoff=False)
@@ -581,8 +595,8 @@ class PitchViewerApp(tk.Tk):
         self.footer = ttk.Label(
             root,
             text=(
-                "v0.9.3: karaoke producción + separación IA opcional con Demucs. "
-                "La letra se despliega al lado derecho al activar Karaoke."
+                "v0.9.4: separación IA offline con Demucs o Audio Separator / UVR; "
+                "exportación WAV/MP3 con ganancias por pista."
             ),
             anchor="w",
         )
@@ -2962,37 +2976,52 @@ class PitchViewerApp(tk.Tk):
 
 
     def _build_separation_panel(self, parent: tk.Widget) -> None:
-        self.separation_panel = ttk.LabelFrame(parent, text="Separación IA", padding=8)
+        self.separation_panel = ttk.LabelFrame(parent, text="Separación IA / offline", padding=8)
 
         controls = ttk.Frame(self.separation_panel)
         controls.pack(fill=tk.X, side=tk.TOP)
 
         ttk.Button(controls, text="Abrir mezcla...", command=self._load_separation_source).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(controls, text="Separar con Demucs", command=self._start_ai_separation).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(controls, text="Separar offline", command=self._start_ai_separation).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(controls, text="Usar voz en karaoke", command=self._use_vocals_stem_for_karaoke).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(controls, text="Exportar mezcla...", command=self._export_separation_mix).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(controls, text="Exportar MP3...", command=lambda: self._export_separation_mix("mp3")).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(controls, text="Exportar WAV...", command=lambda: self._export_separation_mix("wav")).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(controls, text="WAV+MP3...", command=lambda: self._export_separation_mix("both")).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(controls, textvariable=self.separation_status_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         options = ttk.Frame(self.separation_panel)
         options.pack(fill=tk.X, side=tk.TOP, pady=(8, 0))
 
+        ttk.Label(options, text="Motor:").pack(side=tk.LEFT, padx=(0, 4))
+        self.separation_engine_combo = ttk.Combobox(
+            options,
+            textvariable=self.separation_engine_var,
+            values=[ENGINE_DEMUCS, ENGINE_AUDIO_SEPARATOR],
+            state="readonly",
+            width=18,
+        )
+        self.separation_engine_combo.pack(side=tk.LEFT, padx=(0, 12))
+        self.separation_engine_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_separation_engine_changed())
+
         ttk.Label(options, text="Modelo:").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Combobox(
+        self.separation_model_combo = ttk.Combobox(
             options,
             textvariable=self.separation_model_var,
-            values=["htdemucs", "htdemucs_ft"],
+            values=DEMUCS_MODELS,
             state="readonly",
-            width=14,
-        ).pack(side=tk.LEFT, padx=(0, 12))
+            width=38,
+        )
+        self.separation_model_combo.pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Label(options, text="Salida:").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Combobox(
+        self.separation_mode_combo = ttk.Combobox(
             options,
             textvariable=self.separation_mode_var,
             values=["4stems", "2stems"],
             state="readonly",
             width=10,
-        ).pack(side=tk.LEFT, padx=(0, 12))
+        )
+        self.separation_mode_combo.pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Label(options, text="Device:").pack(side=tk.LEFT, padx=(0, 4))
         device_values = ["cpu"]
@@ -3006,16 +3035,18 @@ class PitchViewerApp(tk.Tk):
             width=8,
         ).pack(side=tk.LEFT, padx=(0, 12))
 
+        ffmpeg_text = f"ffmpeg: sí ({self.runtime_info.ffmpeg_source})" if self.runtime_info.ffmpeg_available else "ffmpeg: no"
         cuda_text = "CUDA: sí"
         if self.cuda_available and self.runtime_info.cuda_device_name:
             cuda_text = f"CUDA: sí | {self.runtime_info.cuda_device_name}"
         elif not self.cuda_available:
-            cuda_text = "CUDA: no | Demucs correrá en CPU"
-        ttk.Label(options, text=(cuda_text if len(cuda_text) <= 70 else cuda_text[:67] + "...")).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            cuda_text = "CUDA: no"
+        env_text = f"{cuda_text} | {ffmpeg_text}"
+        ttk.Label(options, text=(env_text if len(env_text) <= 90 else env_text[:87] + "...")).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         progress_row = ttk.Frame(self.separation_panel)
         progress_row.pack(fill=tk.X, side=tk.TOP, pady=(8, 0))
-        ttk.Label(progress_row, textvariable=self.separation_progress_text_var, width=38, anchor="w").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(progress_row, textvariable=self.separation_progress_text_var, width=44, anchor="w").pack(side=tk.LEFT, padx=(0, 8))
         self.separation_progress_bar = ttk.Progressbar(
             progress_row,
             orient=tk.HORIZONTAL,
@@ -3029,8 +3060,31 @@ class PitchViewerApp(tk.Tk):
         self.separation_stems_frame.pack(fill=tk.X, side=tk.TOP, pady=(8, 0))
         ttk.Label(
             self.separation_stems_frame,
-            text="Después de separar, ajusta las ganancias: 100% conserva, 0% silencia.",
+            text="Después de separar, ajusta las ganancias: 100% conserva, 0% silencia. Exporta MP3/WAV o usa vocals como pista karaoke.",
         ).pack(anchor="w")
+        self._on_separation_engine_changed()
+
+    def _on_separation_engine_changed(self) -> None:
+        engine = normalize_engine_id(self.separation_engine_var.get())
+        self.separation_engine_var.set(engine)
+
+        models = models_for_engine(engine)
+        if hasattr(self, "separation_model_combo"):
+            self.separation_model_combo.configure(values=models)
+        if self.separation_model_var.get() not in models:
+            self.separation_model_var.set(default_model_for_engine(engine))
+
+        if hasattr(self, "separation_mode_combo"):
+            if engine == ENGINE_AUDIO_SEPARATOR:
+                self.separation_mode_var.set("2stems")
+                self.separation_mode_combo.configure(values=["2stems"], state="disabled")
+            else:
+                self.separation_mode_combo.configure(values=["4stems", "2stems"], state="readonly")
+                if self.separation_mode_var.get() not in {"4stems", "2stems"}:
+                    self.separation_mode_var.set("4stems")
+
+        label = ENGINE_LABELS.get(engine, engine)
+        self.audio_status_var.set(f"Separación IA: motor seleccionado {label}")
 
     def _toggle_separation_panel(self) -> None:
         if self.separation_panel_visible:
@@ -3072,11 +3126,23 @@ class PitchViewerApp(tk.Tk):
             messagebox.showinfo("Separación IA", "Primero abre una canción o mezcla.", parent=self)
             self._show_separation_panel()
             return
-        if not is_demucs_available():
+        engine = normalize_engine_id(self.separation_engine_var.get())
+        if engine == ENGINE_DEMUCS and not is_demucs_available():
             messagebox.showerror(
                 "Separación IA",
-                "Demucs no está instalado. Instala las dependencias opcionales:\n\n"
+                "Demucs no está instalado. Instala las dependencias estables:\n\n"
                 "pip install -r optional-requirements-separation.txt",
+                parent=self,
+            )
+            self._show_separation_panel()
+            return
+        if engine == ENGINE_AUDIO_SEPARATOR and not is_audio_separator_available():
+            messagebox.showerror(
+                "Separación IA",
+                "Audio Separator / UVR no está instalado. Instálalo solo como extra experimental:\n\n"
+                "python tools/install_separation_dependencies.py\n\n"
+                "Audio Separator / UVR es experimental. Si falla la instalación, "
+                "Demucs queda como motor estable.",
                 parent=self,
             )
             self._show_separation_panel()
@@ -3085,8 +3151,8 @@ class PitchViewerApp(tk.Tk):
         self.separation_running = True
         self.separation_result = None
         self._clear_separation_stem_sliders()
-        self._set_separation_progress(0.01, "Progreso: preparando Demucs")
-        self.separation_status_var.set("Separación IA: ejecutando Demucs")
+        self._set_separation_progress(0.01, "Progreso: preparando separación offline")
+        self.separation_status_var.set("Separación IA: ejecutando separación offline")
         self.audio_status_var.set("Separación IA: proceso en curso")
         self._show_separation_panel()
 
@@ -3096,7 +3162,8 @@ class PitchViewerApp(tk.Tk):
     def _separation_worker(self) -> None:
         try:
             source_path = str(self.separation_source_path or "")
-            model_name = str(self.separation_model_var.get() or "htdemucs")
+            engine = normalize_engine_id(self.separation_engine_var.get())
+            model_name = str(self.separation_model_var.get() or default_model_for_engine(engine))
             mode = str(self.separation_mode_var.get() or "4stems")
             requested_device = str(self.separation_device_var.get() or "cpu").lower()
             device = "cuda" if requested_device.startswith("cuda") and self.cuda_available else "cpu"
@@ -3104,9 +3171,10 @@ class PitchViewerApp(tk.Tk):
             def report(fraction: float, message: str) -> None:
                 self.separation_queue.put(("progress", {"fraction": float(fraction), "message": str(message)}))
 
-            result = run_demucs_separation(
+            result = run_ai_separation(
                 input_path=source_path,
                 output_root=self.separation_output_root,
+                engine=engine,
                 model_name=model_name,
                 device=device,
                 mode=mode,
@@ -3247,19 +3315,43 @@ class PitchViewerApp(tk.Tk):
         self._show_karaoke_panel()
         self._update_karaoke_panel_state(force=True)
 
-    def _export_separation_mix(self) -> None:
+    def _export_separation_mix(self, output_kind: str = "mp3") -> None:
         if self.separation_result is None:
             messagebox.showinfo("Separación IA", "No hay stems para mezclar. Primero separa una canción.", parent=self)
             return
 
-        path = filedialog.asksaveasfilename(
-            title="Exportar mezcla con ganancias",
-            defaultextension=".wav",
-            filetypes=[("WAV", "*.wav"), ("Todos los archivos", "*.*")],
-            initialfile="pitchviewer_mix.wav",
-            parent=self,
-        )
-        if not path:
+        output_kind = str(output_kind or "mp3").lower()
+
+        if output_kind == "both":
+            path = filedialog.asksaveasfilename(
+                title="Exportar mezcla WAV + MP3 con ganancias",
+                defaultextension=".wav",
+                filetypes=[("Base de salida", "*.wav"), ("Todos los archivos", "*.*")],
+                initialfile="pitchviewer_mix.wav",
+                parent=self,
+            )
+            if not path:
+                return
+        else:
+            extension = ".mp3" if output_kind == "mp3" else ".wav"
+            title = "Exportar mezcla MP3 con ganancias" if output_kind == "mp3" else "Exportar mezcla WAV con ganancias"
+            filetypes = [("MP3", "*.mp3"), ("WAV", "*.wav"), ("Todos los archivos", "*.*")] if output_kind == "mp3" else [("WAV", "*.wav"), ("MP3", "*.mp3"), ("Todos los archivos", "*.*")]
+            path = filedialog.asksaveasfilename(
+                title=title,
+                defaultextension=extension,
+                filetypes=filetypes,
+                initialfile=f"pitchviewer_mix{extension}",
+                parent=self,
+            )
+            if not path:
+                return
+
+        if (output_kind in {"mp3", "both"} or str(path).lower().endswith(".mp3")) and not is_ffmpeg_available():
+            messagebox.showerror(
+                "Separación IA",
+                "Para exportar MP3 se requiere ffmpeg. Instala las dependencias de separación con:\n\npython tools/install_separation_dependencies.py\n\nTambién puedes instalar ffmpeg globalmente y agregarlo al PATH.",
+                parent=self,
+            )
             return
 
         gains = {
@@ -3267,14 +3359,21 @@ class PitchViewerApp(tk.Tk):
             for name, var in self.separation_stem_gain_vars.items()
         }
         try:
-            saved = export_mix_with_gains(self.separation_result, gains, path)
+            if output_kind == "both":
+                wav_path, mp3_path = export_mix_pair_with_gains(self.separation_result, gains, path)
+                saved_message = f"{wav_path}\n{mp3_path}"
+                status_name = f"{wav_path.name} + {mp3_path.name}"
+            else:
+                saved = export_mix_with_gains(self.separation_result, gains, path)
+                saved_message = str(saved)
+                status_name = saved.name
         except Exception as exc:
             messagebox.showerror("Separación IA", f"No se pudo exportar la mezcla:\n\n{exc}", parent=self)
             return
 
-        self.separation_status_var.set(f"Mezcla exportada: {saved.name}")
-        self.audio_status_var.set(f"Separación IA: mezcla exportada {saved}")
-        messagebox.showinfo("Separación IA", f"Mezcla exportada:\n{saved}", parent=self)
+        self.separation_status_var.set(f"Mezcla exportada: {status_name}")
+        self.audio_status_var.set(f"Separación IA: mezcla exportada {status_name}")
+        messagebox.showinfo("Separación IA", f"Mezcla exportada:\n{saved_message}", parent=self)
 
 
     def _build_karaoke_panel(self, parent: tk.Widget) -> None:
@@ -4181,10 +4280,10 @@ class PitchViewerApp(tk.Tk):
     def _show_about(self) -> None:
         messagebox.showinfo(
             "Acerca de",
-            "Monitor de afinación vocal - v0.9.0\n\n"
-            "Incluye karaoke producción: carga de pista vocal, análisis offline, letras y guardado .pvk.\n"
-            "Si no hay CUDA, Torchcrepe full queda deshabilitado en vivo, pero sigue disponible como backend offline/record seleccionable.\n"
-            "La configuración guarda también el backend seleccionado.\n\n"
+            "Monitor de afinación vocal - v0.9.4\n\n"
+            "Incluye karaoke producción, separación IA offline, motores Demucs y Audio Separator / UVR, y exportación WAV/MP3.\n"
+            "Si no hay CUDA, los procesos offline pueden correr en CPU; CUDA solo acelera.\n"
+            "Para MP3/M4A/MP4 y exportar MP3 se requiere ffmpeg en PATH.\n\n"
             f"Archivo de configuración:\n{self.settings_path}",
         )
 

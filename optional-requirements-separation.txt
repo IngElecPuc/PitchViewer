@@ -1,4 +1,24 @@
-# Dependencias opcionales para separación vocal/instrumental con IA.
-# Recomendado en Ubuntu con CUDA. En Windows CPU funciona, pero puede tardar bastante.
+# Dependencias para separación vocal/instrumental offline.
+#
+# Instalación recomendada:
+#     python tools/install_separation_dependencies.py
+#
+# Instalación directa mínima:
+#     pip install -r optional-requirements-separation.txt
+#
+# Notas:
+# - imageio-ffmpeg entrega un binario ffmpeg usable desde Python, útil para MP3.
+# - Demucs es el motor estable recomendado.
+# - Audio Separator / UVR se intenta desde el instalador Python y no desde este
+#   archivo, porque en Windows + Python 3.14 puede fallar por dependencias
+#   nativas como diffq-fixed. Si falla, el instalador continúa y Demucs queda usable.
+
+# Motor principal: Demucs / Hybrid Transformer Demucs.
 demucs
+
+# Carga/escritura de WAV y stems.
 soundfile
+
+# Binario ffmpeg empaquetado para Python. Permite exportar MP3 desde la app
+# aunque ffmpeg.exe no esté instalado globalmente en PATH.
+imageio-ffmpeg

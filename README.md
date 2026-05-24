@@ -1,65 +1,125 @@
-# Pitch Viewer v0.9.3
+# Pitch Viewer v0.9.4
 
-Monitor de afinación vocal en Python/Tkinter con modo karaoke producción y separación IA opcional.
+Aplicación Tkinter para monitoreo de afinación vocal, análisis offline, producción karaoke y separación offline de fuentes.
 
-## Ejecutar
+## Ejecución
 
 ```bash
-cd "E:\\Felpipe\\Proyectos propios\\PitchViewer"
+cd "E:\Felpipe\Proyectos propios\PitchViewer"
 pip install -r requirements.txt
 python .\main.py
 ```
 
-## Dependencias opcionales
+## Dependencias de separación IA
 
-Backends Torchcrepe:
+La separación de canciones completas es un proceso offline. CUDA solo acelera; no cambia el flujo.
+
+Instalación recomendada:
 
 ```bash
-pip install -r optional-requirements-torchcrepe.txt
+python .\tools\install_separation_dependencies.py
 ```
 
-Separación IA con Demucs:
+Ese instalador hace lo siguiente:
+
+```text
+1. Instala siempre la ruta estable:
+   - demucs
+   - soundfile
+   - imageio-ffmpeg
+
+2. Intenta dejar disponible Audio Separator / UVR.
+   Si falla, no aborta: Demucs queda usable.
+```
+
+Instalación mínima equivalente:
 
 ```bash
 pip install -r optional-requirements-separation.txt
 ```
 
-En Windows sin CUDA, Demucs y Torchcrepe full pueden correr en CPU, pero pueden tardar bastante. En Ubuntu con CUDA, la app detecta CUDA al iniciar y reutiliza ese estado cacheado para Torchcrepe y Demucs.
+## ffmpeg en Windows
 
-## Cambios v0.9.3
+La app puede usar dos rutas:
 
-- Nuevo panel escondible de **Separación IA**.
-- Nuevo menú `Separación IA`.
-- Integración opcional con Demucs vía `python -m demucs`.
-- Separación de canción/mezcla en stems.
-- Barra de progreso/estado para separación.
-- Barras de ganancia por pista detectada:
-  - voz;
-  - batería;
-  - bajo;
-  - otros instrumentos;
-  - instrumental, en modo 2 stems.
-- Exportación de mezcla WAV con ganancias ajustadas.
-- Carga directa de `vocals.wav` como pista de karaoke producción.
-- Estado CUDA centralizado al inicio de la app en `runtime.py`.
+```text
+1. ffmpeg global en PATH.
+2. ffmpeg empaquetado por imageio-ffmpeg.
+```
 
-## Flujo sugerido para separación + karaoke
+Por eso `imageio-ffmpeg` está incluido en `optional-requirements-separation.txt`. Para uso fuera de Python, o si otra herramienta exige `ffmpeg.exe` global, instala ffmpeg con uno de estos métodos:
 
-1. `Separación IA > Mostrar/ocultar panel separación IA`.
-2. `Abrir mezcla...`.
-3. Elegir modelo y salida:
-   - `htdemucs` + `4stems` por defecto;
-   - `2stems` si solo quieres `vocals` y `no_vocals`.
-4. `Separar con Demucs`.
-5. Ajustar ganancias si quieres exportar una mezcla.
-6. `Usar voz en karaoke`.
-7. `Karaoke > Analizar pista vocal`.
-8. Guardar `.pvk`.
+```powershell
+winget install Gyan.FFmpeg
+```
 
-## Commit sugerido
+O con Chocolatey:
+
+```powershell
+choco install ffmpeg
+```
+
+Luego abre una nueva terminal y revisa:
 
 ```bash
-git add .
-git commit -m "feat: add AI source separation panel"
-git tag v0.9.3
+ffmpeg -version
+```
+
+## Diagnóstico
+
+```bash
+python .\tools\diagnose_separation_dependencies.py
+```
+
+Debe indicar, como mínimo:
+
+```text
+[OK] ffmpeg
+[OK] demucs
+```
+
+Audio Separator / UVR puede aparecer como no disponible sin bloquear el flujo principal.
+
+Si Audio Separator / UVR queda instalado, puedes listar modelos con:
+
+```bash
+python .\tools\list_audio_separator_models.py
+```
+
+## Separación IA offline
+
+Panel:
+
+```text
+Separación IA > Mostrar/ocultar panel separación IA
+```
+
+Motores:
+
+```text
+Demucs                 recomendado, estable
+Audio Separator / UVR  experimental, depende del entorno
+```
+
+Flujo básico con una canción MP3:
+
+```text
+1. Separación IA > Mostrar/ocultar panel separación IA.
+2. Abrir mezcla...
+3. Elegir motor.
+4. Elegir modelo.
+5. Separar offline.
+6. Ajustar ganancias por stem.
+7. Exportar MP3, WAV o ambos.
+8. Usar voz en karaoke.
+```
+
+## Versiones relevantes
+
+```text
+v0.9.0: karaoke producción .pvk
+v0.9.1: letras en panel lateral
+v0.9.2: barra de progreso para análisis karaoke
+v0.9.3: panel de separación IA
+v0.9.4: separación offline más robusta, exportación MP3/WAV y motor experimental Audio Separator / UVR
 ```
